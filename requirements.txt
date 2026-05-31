@@ -1,0 +1,7 @@
+numpy 
+matplotlib 
+wheel
+pandas
+seaborn
+scikit-learn 
+scipy

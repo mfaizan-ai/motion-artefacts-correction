@@ -1,0 +1,31 @@
+11:38:40  INFO      ============================================================
+11:38:40  INFO        BRAIN EXTRACTION VERIFICATION
+11:38:40  INFO      ============================================================
+11:38:40  INFO        Input dir  : /lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/normalized_to_common_space
+11:38:40  INFO        Output dir : /lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/normalized_to_common_space_cycleGANS_preprocessed_data
+11:38:40  INFO        Mask dir   : /lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/templates/mask
+11:38:40  INFO        Report     : verification_report.csv
+11:38:40  INFO      ============================================================
+11:38:40  INFO      Discovering input files...
+11:38:41  INFO      Found 599 expected output files across all subjects
+13:02:09  INFO      
+Full report saved → verification_report.csv
+
+============================================================
+  VERIFICATION SUMMARY
+============================================================
+  Total expected files : 599
+  PASS                 : 599  (100.0%)
+  FAIL                 : 0  (0.0%)
+  MISSING              : 0  (0.0%)
+============================================================
+
+  Breakdown by task:
+    rest10       — PASS=135  FAIL=0  MISSING=0
+    rest5        — PASS=12  FAIL=0  MISSING=0
+    videos       — PASS=452  FAIL=0  MISSING=0
+
+  All files passed verification.
+============================================================
+
+  Full report → verification_report.csv
