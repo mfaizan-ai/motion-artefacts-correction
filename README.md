@@ -1,7 +1,48 @@
-## Motion correction with CyleGANS
+# Motion correction with CyleGANS
 
-preprocessing details to be addd. 
 
+
+## Motion corrupted data selection from the video state fMRI 
+
+This step identifies fMRI time-series chunks that contain sustained head-motion artefacts and prepares them as the **motion-corrupted domain** for CycleGAN training.
+
+### Overview
+
+For each video-task BOLD run, framewise displacement (FD) is calculated from the corresponding motion-parameter file. A sliding window is then moved across the FD time series to identify chunks that contain meaningful and sustained motion contamination.
+
+Each accepted chunk is saved as a row in the output CSV, including the subject/session/run information, BOLD file path, chunk start and end volumes, and FD-based motion statistics.
+
+### Selection Criteria
+
+A chunk is labelled as motion-corrupted when it satisfies the following conditions:
+
+- A sufficient fraction of volumes exceed the high-motion FD threshold.
+- The chunk contains a sustained motion event across consecutive volumes.
+- The mean FD of the chunk indicates meaningful motion severity.
+- Extremely large, catastrophic FD values are excluded using a maximum-FD guard.
+
+### Default Settings
+
+| Parameter | Default | Description |
+|---|---:|---|
+| `chunk_size` | `20` | Number of volumes per chunk |
+| `step` | `1` | Sliding-window step size |
+| `thr_high` | `1.0 mm` | FD threshold for high-motion volumes |
+| `min_frac_high` | `0.5` | Minimum fraction of high-motion volumes |
+| `min_sustained` | `3` | Minimum consecutive high-motion volumes |
+| `min_mean_fd` | `1.0 mm` | Minimum mean FD required for the chunk |
+| `max_fd` | `10.0 mm` | Upper FD limit to remove catastrophic artefacts |
+
+The script generates a CSV file containing all selected corrupted chunks:
+
+```text
+subject_id, session_id, run_id, task,
+bold_file, motion_parameter_file,
+chunk_start, chunk_end,
+chunk_mean_fd, chunk_max_fd,
+n_vols_above_thr, frac_vols_above_thr,
+max_sustained_streak, n_total_vols_in_run
+```
 
 ## CycleGAN Dataset Construction
 
