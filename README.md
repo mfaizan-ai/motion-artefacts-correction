@@ -1,6 +1,6 @@
-# Motion correction with CyleGANS
+# CycleGAN-Based fMRI Motion Artefact Correction
 
-
+motion artefact correction is treated as an **unpaired image-to-image translation task**. Motion-corrupted chunks and low-motion chunks represent two separate domains, and a CycleGAN-like model learns to map corrupted fMRI data toward the motion-free distribution. The architecture aims to separate motion artefacts from the underlying BOLD signal content, while preserving spatial structure and temporal consistency. Training is guided using adversarial, cycle-consistency, identity, and structure-preserving losses.
 
 ## Motion corrupted data selection from the video state fMRI 
 
