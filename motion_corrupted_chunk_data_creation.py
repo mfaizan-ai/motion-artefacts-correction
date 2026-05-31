@@ -1,50 +1,8 @@
 #!/usr/bin/env python3
 """
-corrupted_chunks.py
-===================
-Extract motion-corrupted chunks from fMRI runs for CycleGAN training.
-
-A chunk of CHUNK_SIZE volumes is accepted as corrupted if ALL four
-criteria are met:
-
-  1. Fraction high   : >= MIN_FRAC_HIGH   of volumes have FD >= THR_HIGH
-  2. Sustained event : >= MIN_SUSTAINED   consecutive volumes above THR_HIGH
-  3. Mean FD         : chunk mean FD      >= MIN_MEAN_FD
-  4. Not catastrophic: chunk max  FD      <  MAX_FD
-
-A sliding window of STEP volumes is used so every possible position
-in the run is evaluated — maximising the number of chunks found.
-
-Inputs
-------
-  --mapping      Mapping CSV: bids_key, video_bold_file, motion_parameter_file
-  --output       Output chunks CSV path
-
-Optional
---------
-  --radius        Brain radius in mm (default 50.0)
-  --chunk_size    Volumes per chunk (default 20)
-  --step          Sliding window step in volumes (default 1 = maximum yield)
-  --thr_high      FD threshold for a volume to count as high-motion (default 1.0 mm)
-  --min_frac_high Min fraction of volumes above thr_high (default 0.5 = 50%)
-  --min_sustained Min consecutive volumes above thr_high (default 3)
-  --min_mean_fd   Min chunk mean FD in mm (default 1.0)
-  --max_fd        Max allowed FD in chunk — catastrophe guard (default 10.0 mm)
-
-Outputs
--------
-  CSV with one row per accepted chunk:
-    subject_id, session_id, run_id, task,
-    bold_file, motion_parameter_file,
-    chunk_start, chunk_end,
-    chunk_mean_fd, chunk_max_fd,
-    n_vols_above_thr, frac_vols_above_thr,
-    max_sustained_streak,
-    n_total_vols_in_run
-
 Usage
 -----
-  python corrupted_chunks.py \\
+  python motion_corrupted_chunk_data_creation.py \\
       --mapping  bold_parameters_mapping.csv \\
       --output   corrupted_chunks.csv
 """
@@ -60,7 +18,7 @@ import pandas as pd
 from tqdm import tqdm
 
 
-# ── Logging ────────────────────────────────────────────────────────────────
+# Logging 
 logging.basicConfig(
     level   = logging.INFO,
     format  = "%(asctime)s  %(levelname)-8s  %(message)s",
@@ -69,9 +27,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# =============================================================================
 # ARGUMENT PARSING
-# =============================================================================
 def parse_args():
     """Parse and validate command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -146,9 +102,8 @@ def parse_args():
     return args
 
 
-# =============================================================================
+
 # BIDS KEY PARSER
-# =============================================================================
 def parse_bids_key(bids_key: str) -> dict:
     """
     Extract BIDS entities from a bids_key string.
@@ -172,9 +127,8 @@ def parse_bids_key(bids_key: str) -> dict:
     }
 
 
-# =============================================================================
+
 # FD COMPUTATION
-# =============================================================================
 def compute_fd(par_file: Path, radius_mm: float) -> np.ndarray:
     """
     Compute framewise displacement from an FSL MCFLIRT .par file.
@@ -206,9 +160,8 @@ def compute_fd(par_file: Path, radius_mm: float) -> np.ndarray:
     return np.concatenate([[0.0], fd])
 
 
-# =============================================================================
+
 # CHUNK CRITERIA
-# =============================================================================
 def max_consecutive_above(fd_chunk: np.ndarray, threshold: float) -> int:
     """
     Return the length of the longest consecutive run of volumes
@@ -289,9 +242,8 @@ def is_corrupted_chunk(fd_chunk:     np.ndarray,
     return passed, stats
 
 
-# =============================================================================
+
 # PER-RUN CHUNK EXTRACTION
-# =============================================================================
 def extract_corrupted_chunks(fd:           np.ndarray,
                               chunk_size:   int,
                               step:         int,
@@ -341,9 +293,7 @@ def extract_corrupted_chunks(fd:           np.ndarray,
     return chunks
 
 
-# =============================================================================
 # PER-RUN PROCESSING
-# =============================================================================
 def process_run(row:  pd.Series,
                 args: argparse.Namespace) -> list[dict]:
     """
@@ -422,7 +372,7 @@ def process_run(row:  pd.Series,
 def main():
     args = parse_args()
 
-    # ── Print configuration ────────────────────────────────────────────────
+    # Print configuration
     log.info("=" * 60)
     log.info("  CORRUPTED CHUNK EXTRACTION")
     log.info("=" * 60)
@@ -438,7 +388,7 @@ def main():
     log.info(f"  Max chunk FD (guard) : {args.max_fd} mm")
     log.info("=" * 60)
 
-    # ── Load mapping CSV ───────────────────────────────────────────────────
+    # Load mapping CSV 
     mapping = pd.read_csv(args.mapping)
     required = {"bids_key", "video_bold_file", "motion_parameter_file"}
     missing  = required - set(mapping.columns)
@@ -448,7 +398,7 @@ def main():
 
     log.info(f"Loaded {len(mapping)} runs from {args.mapping}")
 
-    # ── Process all runs ───────────────────────────────────────────────────
+    # Process all runs 
     all_records = []
 
     for _, row in tqdm(mapping.iterrows(),
@@ -458,7 +408,7 @@ def main():
         records = process_run(row, args)
         all_records.extend(records)
 
-    # ── Save output CSV ────────────────────────────────────────────────────
+    # Save output CSV 
     if not all_records:
         log.warning("No corrupted chunks found across all runs.")
         sys.exit(0)
@@ -483,7 +433,7 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     df_out.to_csv(args.output, index=False)
 
-    # ── Final summary ──────────────────────────────────────────────────────
+    # Final summary 
     log.info("=" * 60)
     log.info("  DONE")
     log.info("=" * 60)

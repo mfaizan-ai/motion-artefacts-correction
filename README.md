@@ -44,6 +44,12 @@ n_vols_above_thr, frac_vols_above_thr,
 max_sustained_streak, n_total_vols_in_run
 ```
 
+```bash
+python motion_corrupted_chunk_data_creation.py \\
+      --mapping  bold_parameters_mapping.csv \\
+      --output   corrupted_chunks.csv
+```
+
 ## Low-motion data selection from the video and resting state fMRI 
 
 This step extracts low-motion fMRI chunks that are suitable for the **motion-free / clean domain** in CycleGAN training.
