@@ -21,7 +21,7 @@ A chunk is labelled as motion-corrupted when it satisfies the following conditio
 - The mean FD of the chunk indicates meaningful motion severity.
 - Extremely large, catastrophic FD values are excluded using a maximum-FD guard.
 
-### Default Settings
+### High motion chunk selection criteria:
 
 | Parameter | Default | Description |
 |---|---:|---|
@@ -43,6 +43,39 @@ chunk_mean_fd, chunk_max_fd,
 n_vols_above_thr, frac_vols_above_thr,
 max_sustained_streak, n_total_vols_in_run
 ```
+
+## Low-motion data selection from the video and resting state fMRI 
+
+This step extracts low-motion fMRI chunks that are suitable for the **motion-free / clean domain** in CycleGAN training.
+
+### Overview
+
+For each fMRI run, framewise displacement (FD) is calculated from the corresponding motion-parameter file. Volumes with FD above the low-motion threshold are treated as motion spikes. To avoid selecting volumes close to motion events, a temporal buffer is removed before and after each spike.
+
+The remaining volumes are considered safe low-motion regions. Fixed-size, non-overlapping chunks are then extracted from these safe regions and saved to an output CSV.
+
+### Safe-Zone criteria
+
+A volume is considered part of a safe zone if:
+
+- Its FD is below the low-motion threshold.
+- It is not within the buffer before a motion spike.
+- It is not within the buffer after a motion spike.
+
+This helps ensure that selected chunks are not only low-motion, but also temporally separated from nearby motion artefacts.
+
+### Default Settings
+
+| Parameter | Default | Description |
+|---|---:|---|
+| `chunk_size` | `20` | Number of volumes per extracted chunk |
+| `thr_low` | `0.25 mm` | FD threshold used to identify motion spikes |
+| `buf_before` | `5` | Volumes excluded before each spike |
+| `buf_after` | `10` | Volumes excluded after each spike |
+| `radius` | `50.0 mm` | Brain radius used to convert rotations into displacement |
+
+and it saves the chunk in csv file as for the motion corrupted data. 
+
 
 ## CycleGAN Dataset Construction
 
