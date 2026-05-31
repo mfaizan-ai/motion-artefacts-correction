@@ -1,8 +1,8 @@
 ## Motion correction with CyleGANS
+
 preprocessing details to be addd. 
 
 
-### Building chunked low-motion and motion corrupted data 
 ## CycleGAN Dataset Construction
 
 The CycleGAN dataset was created using the script `build_cyclegan_dataset.py`. The goal of this script is to build an unpaired image-to-image translation dataset for fMRI motion artefact correction, where the two domains are:
