@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=06:00:00
+#SBATCH --time=10:00:00
 #SBATCH --partition=gpu
 
 # set -euo pipefail
@@ -50,7 +50,7 @@ echo "Motion-free video CSV: $MOTION_FREE_VIDEO_CSV"
 echo "Motion-free rest CSV: $MOTION_FREE_REST_CSV"
 echo "Output directory: $OUTPUT_DIR"
 
-python -u build_cycle_gans_dataset.py \
+python -u ../build_cycle_gans_dataset.py \
     --corrupted_csv "$CORRUPTED_CSV" \
     --motion_free_video_csv "$MOTION_FREE_VIDEO_CSV" \
     --motion_free_rest_csv "$MOTION_FREE_REST_CSV" \

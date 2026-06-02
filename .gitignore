@@ -1,0 +1,9 @@
+logs/
+__pycache__/
+.vscode
+*.pdf
+*.docx
+*.pt
+*.pth
+*.log
+
