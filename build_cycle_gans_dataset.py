@@ -5,18 +5,12 @@ build_cyclegan_dataset.py
 Build a CycleGAN-ready fMRI chunk dataset from motion-corrupted and
 motion-free chunk CSVs.
 
-Key improvements over v1:
-    1. Pre-scans ALL output directories (train/val/test, both domains) once
-       at startup into a single in-memory set — skips any chunk already
-       extracted anywhere, not just in the current target directory.
-    2. gzip compression level 1 on save (3-5x faster writes, negligible
-       size difference for NIfTI data).
-    3. Parallel processing across source NIfTI files using joblib —
-       multiple files loaded and chunked simultaneously.
-    4. Each source NIfTI still loaded only once per file (groupby).
+By default only val and test splits are generated. Use --splits to
+control exactly which splits are processed.
 
 Usage
 -----
+    # Default: val + test only (training already done)
     python build_cyclegan_dataset.py \\
         --corrupted_csv          corrupted_chunks_with_preprocessed.csv \\
         --motion_free_video_csv  video_state_clean_chunk_dataset_with_preprocessed.csv \\
@@ -25,7 +19,11 @@ Usage
         --seed                   42 \\
         --n_jobs                 8
 
-    # Metadata only, no extraction
+    # Explicitly choose which splits to run
+    python build_cyclegan_dataset.py ... --splits val test
+    python build_cyclegan_dataset.py ... --splits train val test
+
+    # Metadata only, no NIfTI extraction
     python build_cyclegan_dataset.py ... --skip_extraction
 """
 
@@ -52,14 +50,13 @@ TEST_RATIO  = 0.15
 
 DOMAIN_CORRUPTED = "A_corrupted"
 DOMAIN_MOTFREE   = "B_motion_free"
-SPLITS           = ["train", "val", "test"]
+ALL_SPLITS       = ["train", "val", "test"]
 
 CHUNK_FILENAME_TEMPLATE = (
     "sub-{subject_id}_ses-{session_id}_task-{task}"
     "_run-{run_id}_chunk-{chunk_start}-{chunk_end}.nii.gz"
 )
 
-# gzip level 1 = fastest compression, negligible size difference for NIfTI
 GZIP_LEVEL = 1
 
 
@@ -120,8 +117,21 @@ def parse_args() -> argparse.Namespace:
         "--skip_extraction", action="store_true",
         help="Build metadata CSVs only — skip NIfTI chunk extraction.",
     )
+    parser.add_argument(
+        "--splits", nargs="+", choices=ALL_SPLITS,
+        default=["val", "test"],
+        metavar="SPLIT",
+        help=(
+            "Which splits to process. Choices: train val test. "
+            "Default: val test  (training data already generated). "
+            "Example: --splits val test  or  --splits train val test"
+        ),
+    )
 
     args = parser.parse_args()
+
+    # Deduplicate and preserve canonical order
+    args.splits = [s for s in ALL_SPLITS if s in args.splits]
 
     for p in [args.corrupted_csv,
               args.motion_free_video_csv,
@@ -141,19 +151,10 @@ def build_existing_chunks_set(output_dir: Path) -> set[str]:
     of already-extracted chunk filenames (stem only, no path).
 
     Checking membership in this set (O(1) dict lookup) replaces thousands
-    of individual Path.exists() filesystem calls, which are expensive on
-    network filesystems like lustre.
-
-    Parameters
-    ----------
-    output_dir : Path   root dataset directory
-
-    Returns
-    -------
-    set of str   filenames (e.g. 'sub-ICC155_ses-1_..._chunk-0-19.nii.gz')
+    of individual Path.exists() filesystem calls.
     """
     existing = set()
-    for split in SPLITS:
+    for split in ALL_SPLITS:
         for domain in [DOMAIN_CORRUPTED, DOMAIN_MOTFREE]:
             domain_dir = output_dir / split / domain
             if domain_dir.exists():
@@ -161,7 +162,7 @@ def build_existing_chunks_set(output_dir: Path) -> set[str]:
                     existing.add(f.name)
 
     log.info(f"  Pre-scan: {len(existing):,} chunks already on disk "
-             f"(skipped regardless of split/domain)")
+             f"(will be skipped regardless of split/domain)")
     return existing
 
 
@@ -170,7 +171,6 @@ def build_existing_chunks_set(output_dir: Path) -> set[str]:
 # =============================================================================
 
 def load_and_validate(csv_path: Path, label: str) -> pd.DataFrame:
-    """Load a chunk CSV and verify required columns exist."""
     required = {
         "subject_id", "session_id", "run_id", "task",
         "preprocessed_bold_file", "chunk_start", "chunk_end",
@@ -185,7 +185,6 @@ def load_and_validate(csv_path: Path, label: str) -> pd.DataFrame:
 
 
 def filter_existing_files(df: pd.DataFrame, label: str) -> pd.DataFrame:
-    """Keep only rows where preprocessed_bold_file exists on disk."""
     n_before = len(df)
     if "preprocessed_exists" in df.columns:
         df = df[df["preprocessed_exists"] == True].copy()
@@ -202,7 +201,6 @@ def filter_existing_files(df: pd.DataFrame, label: str) -> pd.DataFrame:
 # =============================================================================
 def split_subjects(subjects: list[str],
                    seed: int) -> tuple[list[str], list[str], list[str]]:
-    """Split subjects 70 / 15 / 15 into train / val / test."""
     train_subs, valtest = train_test_split(
         subjects, test_size=VAL_RATIO + TEST_RATIO, random_state=seed,
     )
@@ -217,7 +215,6 @@ def split_subjects(subjects: list[str],
 def assign_splits(df_corrupted: pd.DataFrame,
                   df_motfree:   pd.DataFrame,
                   seed: int) -> tuple[dict, dict]:
-    """Assign every subject to exactly one split."""
     all_subs = sorted(
         set(df_corrupted["subject_id"].unique()) |
         set(df_motfree["subject_id"].unique())
@@ -248,7 +245,6 @@ def assign_splits(df_corrupted: pd.DataFrame,
 # BALANCED SAMPLING
 # =============================================================================
 def balanced_sample(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
-    """Sample n rows from df, or return all if df is smaller than n."""
     if len(df) <= n:
         log.warning(f"  Corrupted pool ({len(df)}) < target ({n}). Using all.")
         return df.copy()
@@ -284,33 +280,11 @@ def _extract_one_file(bold_path_str:  str,
                       domain:         str,
                       split:          str,
                       existing_names: set[str]) -> tuple[dict, list[dict]]:
-    """
-    Load one source NIfTI file and extract all required chunks from it.
-
-    This function is designed to be called in parallel — one call per
-    unique source file. Returns results without side effects so joblib
-    can safely serialise them.
-
-    Parameters
-    ----------
-    bold_path_str  : str        path to the source 4D NIfTI
-    group          : DataFrame  rows belonging to this source file
-    domain_dir     : Path       output directory for this domain
-    domain         : str
-    split          : str
-    existing_names : set        filenames already on disk (global pre-scan)
-
-    Returns
-    -------
-    chunk_map  : { dataframe_index: chunk_path_str }
-    log_rows   : list of log dicts
-    """
     chunk_map: dict[int, str] = {}
     log_rows:  list[dict]     = []
 
     bold_path = Path(bold_path_str)
 
-    # ── Load full 4D volume once ───────────────────────────────────────────
     try:
         img  = nib.load(str(bold_path))
         data = np.asarray(img.dataobj, dtype=np.float32)
@@ -332,7 +306,6 @@ def _extract_one_file(bold_path_str:  str,
 
     n_vols = data.shape[3]
 
-    # ── Extract each chunk from this file ──────────────────────────────────
     for idx, row in group.iterrows():
         chunk_start = int(row["chunk_start"])
         chunk_end   = int(row["chunk_end"])
@@ -347,7 +320,6 @@ def _extract_one_file(bold_path_str:  str,
         )
         output_path = domain_dir / filename
 
-        # ── Skip if already extracted ANYWHERE (global pre-scanned set) ────
         if filename in existing_names:
             chunk_map[idx] = str(output_path)
             log_rows.append(
@@ -356,7 +328,6 @@ def _extract_one_file(bold_path_str:  str,
             )
             continue
 
-        # ── Validate chunk indices ─────────────────────────────────────────
         if chunk_start < 0 or chunk_end >= n_vols or chunk_start > chunk_end:
             msg = (f"Invalid indices [{chunk_start}:{chunk_end}] "
                    f"— file has {n_vols} volumes")
@@ -365,7 +336,6 @@ def _extract_one_file(bold_path_str:  str,
             )
             continue
 
-        # ── Slice ──────────────────────────────────────────────────────────
         try:
             chunk_data = data[..., chunk_start : chunk_end + 1]
             out_img    = nib.Nifti1Image(chunk_data,
@@ -376,7 +346,6 @@ def _extract_one_file(bold_path_str:  str,
 
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # compression level 1 = fastest, trivial size difference
             nib.save(out_img, str(output_path),
                      **{"compression": GZIP_LEVEL}
                      if "compression" in nib.save.__code__.co_varnames
@@ -407,38 +376,14 @@ def extract_all_chunks(df:             pd.DataFrame,
                        log_rows:       list,
                        existing_names: set[str],
                        n_jobs:         int) -> pd.DataFrame:
-    """
-    Extract all chunks in df and save to domain_dir.
-
-    Improvements over v1:
-        - Skips chunks already on disk globally (pre-scanned set)
-        - Parallel processing across source files (joblib)
-        - gzip level 1 compression on save
-
-    Parameters
-    ----------
-    df             : pd.DataFrame
-    domain_dir     : Path
-    domain         : str
-    split          : str
-    log_rows       : list    appended in-place
-    existing_names : set     pre-scanned filenames from all output dirs
-    n_jobs         : int     parallel workers
-
-    Returns
-    -------
-    pd.DataFrame with 'chunk_path' column added
-    """
     domain_dir.mkdir(parents=True, exist_ok=True)
 
     df       = df.copy()
     df.index = range(len(df))
     chunk_paths = [""] * len(df)
 
-    # ── Group by source file ───────────────────────────────────────────────
     groups = list(df.groupby("preprocessed_bold_file"))
 
-    # ── Run in parallel — one job per source file ──────────────────────────
     results = Parallel(n_jobs=n_jobs, backend="loky", verbose=0)(
         delayed(_extract_one_file)(
             bold_path_str  = bold_path_str,
@@ -451,7 +396,6 @@ def extract_all_chunks(df:             pd.DataFrame,
         for bold_path_str, group in groups
     )
 
-    # ── Collect results ────────────────────────────────────────────────────
     n_ok = n_skip = n_err = 0
     for chunk_map, file_log_rows in results:
         for idx, path in chunk_map.items():
@@ -501,12 +445,17 @@ def main() -> None:
     log.info(f"  Seed                : {args.seed}")
     log.info(f"  Workers             : {args.n_jobs}")
     log.info(f"  Skip extraction     : {args.skip_extraction}")
+    log.info(f"  Splits to process   : {args.splits}")
     log.info("=" * 65)
+
+    if "train" not in args.splits:
+        log.info("  ⚠  'train' not in --splits — training data will NOT be "
+                 "generated or overwritten.")
 
     # ── Create output directories ──────────────────────────────────────────
     meta_dir = args.output_dir / "metadata"
     meta_dir.mkdir(parents=True, exist_ok=True)
-    for split in SPLITS:
+    for split in ALL_SPLITS:
         for domain in [DOMAIN_CORRUPTED, DOMAIN_MOTFREE]:
             (args.output_dir / split / domain).mkdir(parents=True, exist_ok=True)
 
@@ -532,10 +481,12 @@ def main() -> None:
     df_motfree   = filter_existing_files(df_motfree,   "motion_free")
     log.info(f"  corrupted={len(df_corrupted)}  motion_free={len(df_motfree)}")
 
-    # ── Subject-level split ────────────────────────────────────────────────
-    log.info("\nSplitting subjects...")
+    # ── Subject-level split — always computed from full data to keep
+    #    the same subject assignments regardless of --splits value ──────────
+    log.info("\nSplitting subjects (full split computed for consistency)...")
     splits, split_map = assign_splits(df_corrupted, df_motfree, args.seed)
 
+    # Save subject split map once (safe to overwrite; content is deterministic)
     save_csv(
         pd.DataFrame([
             {"subject_id": sub, "split": split}
@@ -545,10 +496,14 @@ def main() -> None:
         meta_dir / "subject_split.csv",
     )
 
-    # ── Process each split ─────────────────────────────────────────────────
+    # ── Process only the requested splits ─────────────────────────────────
     log_rows: list[dict] = []
 
-    for split in SPLITS:
+    for split in ALL_SPLITS:
+        if split not in args.splits:
+            log.info(f"\n  Skipping '{split}' (not in --splits)")
+            continue
+
         log.info(f"\n{'─' * 55}")
         log.info(f"  {split.upper()}")
         log.info(f"{'─' * 55}")
@@ -617,12 +572,13 @@ def main() -> None:
     log.info("\n" + "=" * 65)
     log.info("  SUMMARY")
     log.info("=" * 65)
-    for split in SPLITS:
+    for split in ALL_SPLITS:
+        skipped = " [skipped]" if split not in args.splits else ""
         n_sub = len(splits[split]["subjects"])
         n_mf  = len(splits[split]["motfree"])
         n_c   = len(splits[split]["corrupted"])
         log.info(f"  {split:5s}  subjects={n_sub:3d}  "
-                 f"motion_free={n_mf:5d}  corrupted={n_c:5d}")
+                 f"motion_free={n_mf:5d}  corrupted={n_c:5d}{skipped}")
     if log_rows:
         df_log = pd.DataFrame(log_rows)
         log.info(

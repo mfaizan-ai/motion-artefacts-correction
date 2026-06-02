@@ -1,19 +1,16 @@
 #!/bin/bash
-#SBATCH --job-name=build_cycleGAN_data
-#SBATCH --output=logs/build_cycleGAN_data_%j.out
-#SBATCH --error=logs/build_cycleGAN_data_%j.err
+#SBATCH --job-name=qc_train_analysis
+#SBATCH --output=logs/qc_train_analysis_%j.out
+#SBATCH --error=logs/qc_train_analysis_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=10:00:00
+#SBATCH --mem=128G
+#SBATCH --time=12:00:00
 #SBATCH --partition=gpu
 
 # set -euo pipefail
 
-# Create log directory before SLURM writes runtime logs if running manually.
-# Note: SLURM itself needs the logs/ directory to already exist before sbatch submission.
 mkdir -p logs
-mkdir -p dataset_build_logs
 
 echo "=========================================="
 echo "Job started on: $(date)"
@@ -22,40 +19,43 @@ echo "Node: ${SLURM_NODELIST:-N/A}"
 echo "Working directory: $(pwd)"
 echo "=========================================="
 
-# Load shell configuration and activate conda environment
 source ~/.bashrc
 conda activate moco
 
-# Input CSV files
-CORRUPTED_CSV="dataset/preprocessed/motion_corrupted_chunk_dataset_with_preprocessed.csv"
-MOTION_FREE_VIDEO_CSV="dataset/preprocessed/video_state_clean_chunk_dataset_with_preprocessed.csv"
-MOTION_FREE_REST_CSV="dataset/preprocessed/resting_state_clean_chunk_dataset_with_preprocessed.csv"
-
-# Output directory
 OUTPUT_DIR="/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/faizan_motion_correction_dataset/cyclegans_dataset"
+QC_OUT_DIR="qc_results/train_qc"
 
-# Optional: check that input files exist before running
-for file in "$CORRUPTED_CSV" "$MOTION_FREE_VIDEO_CSV" "$MOTION_FREE_REST_CSV"; do
-    if [[ ! -f "$file" ]]; then
-        echo "ERROR: Input file not found: $file"
+if [[ ! -d "$OUTPUT_DIR" ]]; then
+    echo "ERROR: Dataset directory not found: $OUTPUT_DIR"
+    exit 1
+fi
+
+if [[ ! -d "$OUTPUT_DIR/metadata" ]]; then
+    echo "ERROR: Metadata directory not found: $OUTPUT_DIR/metadata"
+    exit 1
+fi
+
+for f in "$OUTPUT_DIR/metadata/train_corrupted_all.csv" \
+         "$OUTPUT_DIR/metadata/train_motion_free.csv"; do
+    if [[ ! -f "$f" ]]; then
+        echo "ERROR: Required metadata CSV not found: $f"
         exit 1
     fi
 done
 
-mkdir -p "$OUTPUT_DIR"
+mkdir -p "$QC_OUT_DIR"
 
-echo "Running CycleGAN dataset build script..."
-echo "Corrupted CSV: $CORRUPTED_CSV"
-echo "Motion-free video CSV: $MOTION_FREE_VIDEO_CSV"
-echo "Motion-free rest CSV: $MOTION_FREE_REST_CSV"
-echo "Output directory: $OUTPUT_DIR"
+echo "Running QC chunk analysis for TRAIN split..."
+echo "Dataset dir  : $OUTPUT_DIR"
+echo "QC output    : $QC_OUT_DIR"
+echo "=========================================="
 
-python -u ../build_cycle_gans_dataset.py \
-    --corrupted_csv "$CORRUPTED_CSV" \
-    --motion_free_video_csv "$MOTION_FREE_VIDEO_CSV" \
-    --motion_free_rest_csv "$MOTION_FREE_REST_CSV" \
-    --output_dir "$OUTPUT_DIR" \
-    --seed 42 \
+python -u dataset_qc_check.py \
+    --metadata_dir "$OUTPUT_DIR/metadata" \
+    --dataset_dir  "$OUTPUT_DIR" \
+    --split        train \
+    --output_dir   "$QC_OUT_DIR" \
+    --n_jobs       8
 
 echo "=========================================="
 echo "Job finished on: $(date)"
