@@ -1,36 +1,13 @@
 #!/usr/bin/env python3
 """
-preprocess_cyclegan_data.py
-===========================
-Prepare Foundcog fMRI data for CycleGAN training.
-
-Applies brain masking only — using the age-appropriate NIHPD infant mask.
-Z-score normalisation is handled per-chunk in the training DataLoader.
-
-Processes only video and resting-state tasks (pictures excluded).
-Mirrors the input directory structure in the output directory.
-Skips files already processed — safe to re-run after interruption.
-Appends to a manifest CSV of all processed files.
-
-Output per run:
-    *_bold_mcf_corrected_flirt_masked.nii.gz   ← brain-masked BOLD
-
 Usage
 -----
-    # Process one subject
-    python preprocess_cyclegan_data.py --subject ICC155
-
-    # Process all subjects sequentially
-    python preprocess_cyclegan_data.py --all
-
-    # Custom paths
     python preprocess_cyclegan_data.py \\
         --subject     ICC155 \\
         --input_dir   /path/to/normalized_to_common_space \\
         --output_dir  /path/to/output \\
         --mask_dir    /path/to/templates/mask
 """
-
 import argparse
 import logging
 import re
@@ -44,9 +21,7 @@ import pandas as pd
 from tqdm import tqdm
 
 
-# =============================================================================
-# DEFAULT PATHS
-# =============================================================================
+# Default paths (can be overridden by command-line arguments)
 DEFAULT_INPUT_DIR = Path(
     "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives"
     "/normalized_to_common_space"
@@ -66,10 +41,7 @@ INCLUDE_TASK_KEYWORDS = ["videos", "rest"]
 SUFFIX_MASKED      = "_masked.nii.gz"
 
 
-# =============================================================================
-# ARGUMENT PARSING
-# =============================================================================
-
+# Argument parsing
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description     = "Brain-mask Foundcog fMRI data for CycleGAN training.",
@@ -103,10 +75,7 @@ def parse_args() -> argparse.Namespace:
 
     return args
 
-
-# =============================================================================
-# LOGGING
-# =============================================================================
+# Logger setup
 def setup_logging(subject: str = None,
                   log_dir: Path = None) -> logging.Logger:
     name = f"cyclegan_{subject}" if subject else "cyclegan_preproc"
@@ -133,10 +102,7 @@ def setup_logging(subject: str = None,
     return log
 
 
-# =============================================================================
-# UTILITIES
-# =============================================================================
-
+# Utility functions
 def get_mask_path(subject_id: str, mask_dir: Path) -> Path:
     """
     Return the correct age-appropriate brain mask for a subject.
@@ -198,9 +164,7 @@ def load_mask(mask_path: Path) -> np.ndarray:
     return data > 0.5
 
 
-# =============================================================================
-# CORE — single file
-# =============================================================================
+# CORE — single file processing
 def process_file(input_path:     Path,
                  output_dir_run: Path,
                  mask_path:      Path,
@@ -290,9 +254,7 @@ def process_file(input_path:     Path,
     }
 
 
-# =============================================================================
-# SUBJECT-LEVEL PROCESSING
-# =============================================================================
+# subject processing loop
 def process_subject(subject_id: str,
                     input_dir:  Path,
                     output_dir: Path,
@@ -351,9 +313,8 @@ def process_subject(subject_id: str,
     return rows
 
 
-# =============================================================================
-# MANIFEST CSV
-# =============================================================================
+
+# CSV manifest handling
 def save_manifest(rows: list[dict], output_dir: Path) -> None:
     """Append rows to manifest CSV, deduplicating by output_path."""
     if not rows:
@@ -375,9 +336,6 @@ def save_manifest(rows: list[dict], output_dir: Path) -> None:
     df_out.to_csv(manifest_path, index=False)
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
 def main() -> None:
     args = parse_args()
 

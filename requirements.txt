@@ -1,3 +1,4 @@
+# key packages to install
 numpy 
 matplotlib 
 wheel

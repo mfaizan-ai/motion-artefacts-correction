@@ -1,42 +1,5 @@
 #!/usr/bin/env python3
 """
-safe_zone_chunks.py
-===================
-Extract low-motion safe-zone chunks from fMRI resting-state runs.
-
-Algorithm per run
------------------
-1. Compute framewise displacement (FD) from FSL MCFLIRT .par file.
-2. Mark every volume where FD >= THR_LOW (0.25 mm) as a spike.
-3. Exclude BUF_BEFORE volumes before and BUF_AFTER volumes after every spike.
-4. The remaining volumes form safe zones (purely low-motion, away from spikes).
-5. Extract non-overlapping chunks of CHUNK_SIZE from each contiguous safe zone.
-6. Write one row per chunk to the output CSV.
-
-Inputs
-------
-  --mapping     Path to mapping CSV.
-                Required columns: bids_key, video_bold_file, motion_parameter_file
-                bids_key must follow BIDS convention:
-                  sub-<id>_ses-<id>_task-<name>_run-<id>
-  --output      Path for the output chunks CSV.
-
-Optional
---------
-  --radius      Brain radius in mm for rotation→mm conversion (default: 35.0).
-  --buf_before  Volumes excluded before each spike (default: 5).
-  --buf_after   Volumes excluded after  each spike (default: 10).
-  --chunk_size  Volumes per chunk (default: 20).
-  --thr_low     FD threshold for low/moderate boundary in mm (default: 0.25).
-
-Outputs
--------
-  <output>.csv  One row per chunk with columns:
-                subject_id, session_id, run_id, task,
-                bold_file, motion_parameter_file,
-                chunk_start, chunk_end,
-                chunk_mean_fd, chunk_max_fd, n_safe_vols_in_run
-
 Usage
 -----
   python safe_zone_chunks.py \\
@@ -47,7 +10,6 @@ Usage
       --buf_after  10 \\
       --chunk_size 20
 """
-
 import argparse
 import re
 import sys
@@ -60,7 +22,7 @@ import pandas as pd
 from tqdm import tqdm
 
 
-# ── Logging ────────────────────────────────────────────────────────────────
+# Logger 
 logging.basicConfig(
     level   = logging.INFO,
     format  = "%(asctime)s  %(levelname)-8s  %(message)s",
@@ -69,9 +31,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# =============================================================================
-# ARGUMENT PARSING
-# =============================================================================
+# Command line argument parsing
 def parse_args():
     """Parse and validate command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -79,7 +39,7 @@ def parse_args():
         formatter_class = argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── Required ───────────────────────────────────────────────────────────
+    # Required 
     parser.add_argument(
         "--mapping", required=True, type=Path,
         metavar="CSV",
@@ -91,7 +51,7 @@ def parse_args():
         help="Output chunks CSV path (e.g. safe_zone_chunks.csv)",
     )
 
-    # ── Optional ───────────────────────────────────────────────────────────
+    # Optional 
     parser.add_argument(
         "--radius", type=float, default=50.0,
         metavar="MM",
@@ -120,7 +80,7 @@ def parse_args():
 
     args = parser.parse_args()
 
-    # ── Validation ─────────────────────────────────────────────────────────
+    # Validation 
     if not args.mapping.exists():
         parser.error(f"Mapping CSV not found: {args.mapping}")
     if args.radius <= 0:
@@ -134,10 +94,7 @@ def parse_args():
 
     return args
 
-
-# =============================================================================
-# BIDS KEY PARSER
-# =============================================================================
+# BIDS key parsing 
 def parse_bids_key(bids_key: str) -> dict:
     """
     Extract BIDS entities from a bids_key string.
@@ -169,9 +126,7 @@ def parse_bids_key(bids_key: str) -> dict:
     return entities
 
 
-# =============================================================================
-# FD COMPUTATION
-# =============================================================================
+# Calculate framewise displacement (FD) from FSL MCFLIRT .par file
 def compute_fd(par_file: Path, radius_mm: float) -> np.ndarray:
     """
     Compute framewise displacement from an FSL MCFLIRT .par file.
@@ -214,9 +169,8 @@ def compute_fd(par_file: Path, radius_mm: float) -> np.ndarray:
     return fd
 
 
-# =============================================================================
-# SAFE ZONE IDENTIFICATION
-# =============================================================================
+
+# Defining safe zones based on FD and buffers 
 def build_safe_mask(fd: np.ndarray,
                     thr_low:    float,
                     buf_before: int,
@@ -274,10 +228,7 @@ def get_safe_regions(safe_mask: np.ndarray) -> list[list[int]]:
             regions.append(indices)
     return regions
 
-
-# =============================================================================
-# CHUNK EXTRACTION
-# =============================================================================
+# Extracting non-overlapping chunks from safe regions
 def extract_chunks_from_regions(safe_regions: list[list[int]],
                                  fd:           np.ndarray,
                                  chunk_size:   int) -> list[dict]:
@@ -320,9 +271,7 @@ def extract_chunks_from_regions(safe_regions: list[list[int]],
     return chunks
 
 
-# =============================================================================
-# PER-RUN PROCESSING
-# =============================================================================
+# Processing one run: compute FD, find safe zones, extract chunks
 def process_run(row:        pd.Series,
                 args:       argparse.Namespace) -> list[dict]:
     """
@@ -342,7 +291,7 @@ def process_run(row:        pd.Series,
     par_file  = Path(row["motion_parameter_file"])
     entities  = parse_bids_key(bids_key)
 
-    # ── Compute FD ─────────────────────────────────────────────────────────
+    # Compute FD 
     try:
         fd = compute_fd(par_file, args.radius)
     except (FileNotFoundError, ValueError) as e:
@@ -351,12 +300,12 @@ def process_run(row:        pd.Series,
 
     n_vols = len(fd)
 
-    # ── Build safe mask ────────────────────────────────────────────────────
+    # Build safe mask
     safe_mask    = build_safe_mask(fd, args.thr_low, args.buf_before, args.buf_after)
     n_safe_vols  = int(safe_mask.sum())
     safe_regions = get_safe_regions(safe_mask)
 
-    # ── Extract chunks ─────────────────────────────────────────────────────
+    #  Extract chunks 
     chunks = extract_chunks_from_regions(safe_regions, fd, args.chunk_size)
 
     if not chunks:
@@ -367,7 +316,7 @@ def process_run(row:        pd.Series,
         )
         return []
 
-    # ── Build output rows ──────────────────────────────────────────────────
+    # Build output rows
     records = []
     for chunk in chunks:
         records.append({
@@ -396,7 +345,7 @@ def process_run(row:        pd.Series,
 def main():
     args = parse_args()
 
-    # ── Print run configuration ────────────────────────────────────────────
+    # Print run configuration 
     log.info("=" * 60)
     log.info("  SAFE ZONE CHUNK EXTRACTION")
     log.info("=" * 60)
@@ -409,7 +358,7 @@ def main():
     log.info(f"  Chunk size       : {args.chunk_size} volumes")
     log.info("=" * 60)
 
-    # ── Load mapping CSV ───────────────────────────────────────────────────
+    # Load mapping CSV 
     mapping = pd.read_csv(args.mapping)
     required_cols = {"bids_key", "video_bold_file", "motion_parameter_file"}
     missing = required_cols - set(mapping.columns)
@@ -419,7 +368,7 @@ def main():
 
     log.info(f"Loaded {len(mapping)} runs from {args.mapping}")
 
-    # ── Process all runs ───────────────────────────────────────────────────
+    # Process all runs
     all_records = []
 
     for _, row in tqdm(mapping.iterrows(),
@@ -429,7 +378,7 @@ def main():
         records = process_run(row, args)
         all_records.extend(records)
 
-    # ── Save output CSV ────────────────────────────────────────────────────
+    # Save output CSV 
     if not all_records:
         log.warning("No chunks extracted from any run. Output CSV not written.")
         sys.exit(0)
@@ -452,7 +401,7 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     df_out.to_csv(args.output, index=False)
 
-    # ── Final summary ──────────────────────────────────────────────────────
+    # print summary 
     log.info("=" * 60)
     log.info("  DONE")
     log.info("=" * 60)

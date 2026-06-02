@@ -6,7 +6,6 @@ Usage
       --mapping  bold_parameters_mapping.csv \\
       --output   corrupted_chunks.csv
 """
-
 import argparse
 import logging
 import re
@@ -27,7 +26,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ARGUMENT PARSING
+# Command line args 
 def parse_args():
     """Parse and validate command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -35,7 +34,7 @@ def parse_args():
         formatter_class = argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── Required ───────────────────────────────────────────────────────────
+    # Required 
     parser.add_argument(
         "--mapping", required=True, type=Path, metavar="CSV",
         help="Mapping CSV: bids_key, video_bold_file, motion_parameter_file",
@@ -45,13 +44,13 @@ def parse_args():
         help="Output corrupted chunks CSV (e.g. corrupted_chunks.csv)",
     )
 
-    # ── FD computation ─────────────────────────────────────────────────────
+    # FD computation 
     parser.add_argument(
         "--radius", type=float, default=50.0, metavar="MM",
         help="Brain radius in mm for rotation→mm conversion",
     )
 
-    # ── Chunk selection ────────────────────────────────────────────────────
+    # Chunk selection 
     parser.add_argument(
         "--chunk_size", type=int, default=20, metavar="N",
         help="Number of volumes per chunk",
@@ -61,7 +60,7 @@ def parse_args():
         help="Sliding window step (1 = maximum chunks, larger = less overlap)",
     )
 
-    # ── Corruption criteria ────────────────────────────────────────────────
+    # Corruption criteria
     parser.add_argument(
         "--thr_high", type=float, default=1.0, metavar="MM",
         help="FD threshold (mm) for a volume to count as high-motion",
@@ -85,7 +84,7 @@ def parse_args():
 
     args = parser.parse_args()
 
-    # ── Validation ─────────────────────────────────────────────────────────
+    # Validation 
     if not args.mapping.exists():
         parser.error(f"Mapping CSV not found: {args.mapping}")
     if not (0.0 < args.min_frac_high <= 1.0):
@@ -102,8 +101,7 @@ def parse_args():
     return args
 
 
-
-# BIDS KEY PARSER
+# Bids entity parsing
 def parse_bids_key(bids_key: str) -> dict:
     """
     Extract BIDS entities from a bids_key string.
@@ -126,9 +124,7 @@ def parse_bids_key(bids_key: str) -> dict:
         for field, p in patterns.items()
     }
 
-
-
-# FD COMPUTATION
+# Calculate framewise displacement (FD) from FSL MCFLIRT .par file
 def compute_fd(par_file: Path, radius_mm: float) -> np.ndarray:
     """
     Compute framewise displacement from an FSL MCFLIRT .par file.
@@ -160,8 +156,7 @@ def compute_fd(par_file: Path, radius_mm: float) -> np.ndarray:
     return np.concatenate([[0.0], fd])
 
 
-
-# CHUNK CRITERIA
+# key motion detection criteria for chunking 
 def max_consecutive_above(fd_chunk: np.ndarray, threshold: float) -> int:
     """
     Return the length of the longest consecutive run of volumes
@@ -242,8 +237,7 @@ def is_corrupted_chunk(fd_chunk:     np.ndarray,
     return passed, stats
 
 
-
-# PER-RUN CHUNK EXTRACTION
+# Per Run chunk extraction
 def extract_corrupted_chunks(fd:           np.ndarray,
                               chunk_size:   int,
                               step:         int,
@@ -293,7 +287,7 @@ def extract_corrupted_chunks(fd:           np.ndarray,
     return chunks
 
 
-# PER-RUN PROCESSING
+# Per run processing: compute FD and extract corrupted chunks
 def process_run(row:  pd.Series,
                 args: argparse.Namespace) -> list[dict]:
     """
@@ -313,7 +307,7 @@ def process_run(row:  pd.Series,
     par_file  = Path(row["motion_parameter_file"])
     entities  = parse_bids_key(bids_key)
 
-    # ── Compute FD ─────────────────────────────────────────────────────────
+    # Compute FD 
     try:
         fd = compute_fd(par_file, args.radius)
     except (FileNotFoundError, ValueError) as e:
@@ -322,7 +316,7 @@ def process_run(row:  pd.Series,
 
     n_vols = len(fd)
 
-    # ── Extract corrupted chunks via sliding window ────────────────────────
+    # Extract corrupted chunks via sliding window
     chunks = extract_corrupted_chunks(
         fd            = fd,
         chunk_size    = args.chunk_size,
@@ -346,7 +340,7 @@ def process_run(row:  pd.Series,
         f"{max(c['chunk_mean_fd'] for c in chunks):.3f} mm"
     )
 
-    # ── Build output rows ──────────────────────────────────────────────────
+    # Build output rows 
     records = []
     for chunk in chunks:
         records.append({

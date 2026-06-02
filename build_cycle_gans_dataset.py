@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
 """
-build_cyclegan_dataset.py
-=========================
-Build a CycleGAN-ready fMRI chunk dataset from motion-corrupted and
-motion-free chunk CSVs.
-
-By default only val and test splits are generated. Use --splits to
-control exactly which splits are processed.
-
 Usage
 -----
-    # Default: val + test only (training already done)
     python build_cyclegan_dataset.py \\
         --corrupted_csv          corrupted_chunks_with_preprocessed.csv \\
         --motion_free_video_csv  video_state_clean_chunk_dataset_with_preprocessed.csv \\
@@ -18,15 +9,7 @@ Usage
         --output_dir             cyclegan_dataset \\
         --seed                   42 \\
         --n_jobs                 8
-
-    # Explicitly choose which splits to run
-    python build_cyclegan_dataset.py ... --splits val test
-    python build_cyclegan_dataset.py ... --splits train val test
-
-    # Metadata only, no NIfTI extraction
-    python build_cyclegan_dataset.py ... --skip_extraction
 """
-
 import argparse
 import logging
 import sys
@@ -40,10 +23,7 @@ from joblib import Parallel, delayed
 from sklearn.model_selection import train_test_split
 
 
-# =============================================================================
-# CONSTANTS
-# =============================================================================
-
+# Key parameters
 TRAIN_RATIO = 0.70
 VAL_RATIO   = 0.15
 TEST_RATIO  = 0.15
@@ -60,9 +40,8 @@ CHUNK_FILENAME_TEMPLATE = (
 GZIP_LEVEL = 1
 
 
-# =============================================================================
-# LOGGING
-# =============================================================================
+
+# Logger setup
 def setup_logging() -> logging.Logger:
     log = logging.getLogger("cyclegan_dataset")
     log.setLevel(logging.INFO)
@@ -76,13 +55,11 @@ def setup_logging() -> logging.Logger:
         log.addHandler(ch)
     return log
 
-
 log = setup_logging()
 
 
-# =============================================================================
-# ARGUMENT PARSING
-# =============================================================================
+
+# Argument parsing 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description     = "Build CycleGAN-ready fMRI chunk dataset.",
@@ -142,9 +119,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-# =============================================================================
 # PRE-SCAN — build a global set of already-extracted chunk filenames
-# =============================================================================
 def build_existing_chunks_set(output_dir: Path) -> set[str]:
     """
     Scan every domain directory across all splits once and return a set
@@ -166,10 +141,8 @@ def build_existing_chunks_set(output_dir: Path) -> set[str]:
     return existing
 
 
-# =============================================================================
-# DATA LOADING & VALIDATION
-# =============================================================================
 
+#  Data loading and validation 
 def load_and_validate(csv_path: Path, label: str) -> pd.DataFrame:
     required = {
         "subject_id", "session_id", "run_id", "task",
@@ -196,9 +169,7 @@ def filter_existing_files(df: pd.DataFrame, label: str) -> pd.DataFrame:
     return df
 
 
-# =============================================================================
-# SUBJECT-LEVEL SPLIT
-# =============================================================================
+# Subject level split (stratified by subject_id, same split for both domains)
 def split_subjects(subjects: list[str],
                    seed: int) -> tuple[list[str], list[str], list[str]]:
     train_subs, valtest = train_test_split(
@@ -240,10 +211,7 @@ def assign_splits(df_corrupted: pd.DataFrame,
     }
     return splits, split_map
 
-
-# =============================================================================
-# BALANCED SAMPLING
-# =============================================================================
+# Balanced sampling of corrupted chunks to match the number of motion-free chunks
 def balanced_sample(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     if len(df) <= n:
         log.warning(f"  Corrupted pool ({len(df)}) < target ({n}). Using all.")
@@ -251,9 +219,7 @@ def balanced_sample(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     return df.sample(n=n, random_state=seed).reset_index(drop=True)
 
 
-# =============================================================================
-# LOG ENTRY HELPER
-# =============================================================================
+# log entry factory 
 def _log_entry(split, domain, row, output_path, status, message) -> dict:
     return {
         "split"      : split,
@@ -271,9 +237,7 @@ def _log_entry(split, domain, row, output_path, status, message) -> dict:
     }
 
 
-# =============================================================================
 # EXTRACTION — one source file (called in parallel)
-# =============================================================================
 def _extract_one_file(bold_path_str:  str,
                       group:          pd.DataFrame,
                       domain_dir:     Path,
@@ -365,10 +329,7 @@ def _extract_one_file(bold_path_str:  str,
     return chunk_map, log_rows
 
 
-# =============================================================================
 # EXTRACTION — all chunks for a dataframe (parallel across source files)
-# =============================================================================
-
 def extract_all_chunks(df:             pd.DataFrame,
                        domain_dir:     Path,
                        domain:         str,
@@ -418,19 +379,12 @@ def extract_all_chunks(df:             pd.DataFrame,
     return df
 
 
-# =============================================================================
-# METADATA SAVING
-# =============================================================================
-
+# Save metadata CSVs
 def save_csv(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
     log.info(f"  Saved → {path.name}  ({len(df)} rows)")
 
-
-# =============================================================================
-# MAIN
-# =============================================================================
 
 def main() -> None:
     args = parse_args()
@@ -452,20 +406,20 @@ def main() -> None:
         log.info("  ⚠  'train' not in --splits — training data will NOT be "
                  "generated or overwritten.")
 
-    # ── Create output directories ──────────────────────────────────────────
+    #  Create output directories
     meta_dir = args.output_dir / "metadata"
     meta_dir.mkdir(parents=True, exist_ok=True)
     for split in ALL_SPLITS:
         for domain in [DOMAIN_CORRUPTED, DOMAIN_MOTFREE]:
             (args.output_dir / split / domain).mkdir(parents=True, exist_ok=True)
 
-    # ── Pre-scan all output directories once ──────────────────────────────
+    # Pre-scan all output directories once
     existing_names: set[str] = set()
     if not args.skip_extraction:
         log.info("\nPre-scanning output directories...")
         existing_names = build_existing_chunks_set(args.output_dir)
 
-    # ── Load and validate ──────────────────────────────────────────────────
+    # Load and validate 
     log.info("\nLoading CSVs...")
     df_corrupted = load_and_validate(args.corrupted_csv,         "corrupted")
     df_vid       = load_and_validate(args.motion_free_video_csv, "motfree_video")
@@ -475,14 +429,14 @@ def main() -> None:
     log.info(f"  Combined motion-free: {len(df_motfree)} "
              f"(video={len(df_vid)}  rest={len(df_rest)})")
 
-    # ── Filter missing files ───────────────────────────────────────────────
+    # Filter missing files 
     log.info("\nFiltering missing files...")
     df_corrupted = filter_existing_files(df_corrupted, "corrupted")
     df_motfree   = filter_existing_files(df_motfree,   "motion_free")
     log.info(f"  corrupted={len(df_corrupted)}  motion_free={len(df_motfree)}")
 
-    # ── Subject-level split — always computed from full data to keep
-    #    the same subject assignments regardless of --splits value ──────────
+    # Subject-level split — always computed from full data to keep
+    #    the same subject assignments regardless of --splits value 
     log.info("\nSplitting subjects (full split computed for consistency)...")
     splits, split_map = assign_splits(df_corrupted, df_motfree, args.seed)
 
@@ -496,7 +450,7 @@ def main() -> None:
         meta_dir / "subject_split.csv",
     )
 
-    # ── Process only the requested splits ─────────────────────────────────
+    # Process only the requested splits 
     log_rows: list[dict] = []
 
     for split in ALL_SPLITS:
@@ -564,11 +518,11 @@ def main() -> None:
             save_csv(df_mf,    meta_dir / f"{split}_motion_free.csv")
             save_csv(df_c_bal, meta_dir / f"{split}_corrupted_balanced.csv")
 
-    # ── Save extraction log ────────────────────────────────────────────────
+    #  Save extraction log 
     if log_rows:
         save_csv(pd.DataFrame(log_rows), meta_dir / "extraction_log.csv")
 
-    # ── Summary ────────────────────────────────────────────────────────────
+    # print summary table
     log.info("\n" + "=" * 65)
     log.info("  SUMMARY")
     log.info("=" * 65)
