@@ -114,6 +114,38 @@ class PatchDiscriminator3D(nn.Module):
         return self.out_conv(x)            # (B,   1,  5,  6,  4)
  
  
+  
+class MotionFreeDiscriminator(PatchDiscriminator3D):
+    """
+    Discriminator for the motion-free domain (D_B).
+ 
+    Real  : x_b       true motion-free chunks from the dataset
+    Fake  : x_hat_b   predicted motion-free chunks from MotionFreeDecoder
+ 
+    Judges whether a chunk belongs to the real motion-free distribution
+    by evaluating both spatial BOLD structure and temporal dynamics.
+    """
+    pass   # identical architecture — name conveys semantic role
+ 
+ 
+class MotionCorruptedDiscriminator(PatchDiscriminator3D):
+    """
+    Discriminator for the motion-corrupted domain (D_A).
+ 
+    Real  : x_a       true motion-corrupted chunks from the dataset
+    Fake  : x_hat_a   predicted corrupted chunks from MotionCorruptedDecoder
+ 
+    Judges whether a chunk belongs to the real corrupted distribution.
+    The temporal difference channels are especially informative here —
+    motion corruption produces characteristic large temporal differences
+    at spike volumes that clean BOLD signal does not.
+    """
+    pass  
+ 
+ 
+ 
+ 
+ 
  # sanity check with dummy input
 if __name__ == "__main__":
     B, T, D, H, W = 2, 20, 80, 96, 72
