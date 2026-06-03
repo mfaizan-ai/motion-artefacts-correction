@@ -1,5 +1,6 @@
 logs/
 __pycache__/
+models/__pycache__/
 dataset_build_logs/
 .vscode
 *.pdf
