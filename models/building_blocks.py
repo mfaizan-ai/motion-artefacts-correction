@@ -302,3 +302,94 @@ class AdaINResBlock3D(nn.Module):
         x = self.adain2(x, a_global)
 
         return self.act2(x + residual)
+    
+
+def compute_temporal_diffs(x: torch.Tensor) -> torch.Tensor:
+    """
+    Compute frame-to-frame temporal difference maps.
+ 
+    For a chunk with T timepoints, produces T-1 difference maps:
+        Δx[t] = x[t+1] - x[t]   for t = 0, 1, ..., T-2
+ 
+    These capture the rate of temporal change — motion artefacts produce
+    sudden large differences while clean BOLD signal changes slowly and
+    smoothly. By appending these as extra input channels the discriminator
+    can directly evaluate temporal dynamics rather than only spatial patterns.
+ 
+    Parameters
+    ----------
+    x : (B, T, D, H, W)   fMRI chunk, T timepoints as channels
+ 
+    Returns
+    -------
+    diffs : (B, T-1, D, H, W)   frame-to-frame differences
+    """
+    # x[:, 1:] = volumes 1..T-1
+    # x[:, :-1] = volumes 0..T-2
+    # diff[t] = volume[t+1] - volume[t]
+    return x[:, 1:, ...] - x[:, :-1, ...]
+ 
+ 
+def append_temporal_diffs(x: torch.Tensor) -> torch.Tensor:
+    """
+    Append temporal difference maps to the chunk as extra channels.
+ 
+    Concatenates the original T timepoints with T-1 difference maps,
+    giving a (B, 2T-1, D, H, W) tensor as discriminator input.
+ 
+    For T=20: input becomes (B, 39, D, H, W)
+        channels  0–19  : original volumes
+        channels 20–38  : frame-to-frame differences
+ 
+    Parameters
+    ----------
+    x : (B, T, D, H, W)
+ 
+    Returns
+    -------
+    (B, 2T-1, D, H, W)
+    """
+    diffs = compute_temporal_diffs(x)       # (B, T-1, D, H, W)
+    return torch.cat([x, diffs], dim=1)     # (B, 2T-1, D, H, W)
+ 
+ 
+class DiscConvBlock(nn.Module):
+    """
+    Single discriminator convolutional block.
+ 
+    Conv3D (stride 2) + optional InstanceNorm + LeakyReLU.
+    Spectral normalisation is applied to the conv weight matrix to
+    constrain the Lipschitz constant of the discriminator and prevent
+    it from dominating the generator during training (Miyato et al. 2018).
+ 
+    The first block omits normalisation following the pix2pix convention —
+    normalising the first layer can destabilise early training when the
+    input statistics are still widely varying.
+ 
+    Parameters
+    ----------
+    in_ch    : int   input channels
+    out_ch   : int   output channels
+    use_norm : bool  apply InstanceNorm after conv (False for first block)
+    """
+ 
+    def __init__(self, in_ch: int, out_ch: int, use_norm: bool = True):
+        super().__init__()
+ 
+        # Spectral normalisation wraps the Conv3d weight matrix
+        conv = nn.utils.spectral_norm(
+            nn.Conv3d(in_ch, out_ch,
+                      kernel_size=4, stride=2, padding=1, bias=not use_norm)
+        )
+        layers = [conv]
+ 
+        if use_norm:
+            layers.append(nn.InstanceNorm3d(out_ch, affine=True))
+ 
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        self.block = nn.Sequential(*layers)
+ 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+    
+    
