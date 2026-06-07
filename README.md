@@ -141,3 +141,26 @@ sbatch run_build_cylegans_data_slurm_job.sh
 
 tail -f logs/logs/build_cycleGAN_data_%j.out
 ```
+
+## CycleGAN fMRI DataLoader
+
+Unpaired dataloader for motion artefact correction using PSC normalisation.
+
+### Normalisation: Percent Signal Change (PSC)
+ 
+Each chunk is normalised voxel-wise using its own temporal mean. Brain voxels express BOLD fluctuations as fractional deviations from baseline, typically in `[-0.1, +0.1]`. Background voxels (zeroed by brain extraction, ~88% of FOV) remain zero throughout.
+ 
+Recovery at inference — `mean_vol_A` is included in every batch and recomputed fresh from disk each load:
+ 
+```python
+corrected_bold = psc_denormalise(model_output, batch["mean_vol_A"])
+```
+### Sanity Check
+ 
+```bash
+python dataset.py \
+    --root /lustre/.../cyclegans_dataset \
+    --splits train val test \
+    --workers 4 \
+    --batch 1
+```
