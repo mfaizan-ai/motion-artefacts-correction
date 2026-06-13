@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-
+# Weights for each loss term
 @dataclass
 class LossWeights:
     """Configurable weights for each generator loss term."""
@@ -30,6 +30,7 @@ class LossWeights:
     art:     float = 0.1
 
 
+# Manages all outputs from the model, including intermediate features and final outputs.
 @dataclass
 class ModelOutputs:
     # Phase 1: encoded features
@@ -39,29 +40,36 @@ class ModelOutputs:
     a_spatial:    Tensor   # (B, 32, D', H', W')   artefact spatial from x_a
     a_global_b:   Tensor   # (B, 64)               artefact global from x_b  → 0
     a_spatial_b:  Tensor   # (B, 32, D', H', W')   artefact spatial from x_b → 0
+    
+    
     # Phase 2: translations and self-reconstructions
     x_hat_b:      Tensor   # (B, T, X, Y, Z)  A→B predicted clean
     x_hat_a:      Tensor   # (B, T, X, Y, Z)  B→A predicted corrupted
     x_self_a:     Tensor   # (B, T, X, Y, Z)  A→A self-reconstruction
     x_self_b:     Tensor   # (B, T, X, Y, Z)  B→B self-reconstruction
+    
+    
     # Phase 3: cyclic re-encodings
     c_hat_b:      Tensor   # (B, 384, D', H', W')  re-encoded from x_hat_b
     c_hat_a:      Tensor   # (B, 384, D', H', W')  re-encoded from x_hat_a
     a_hat_global: Tensor   # (B, 64)
     a_hat_spatial:Tensor   # (B, 32, D', H', W')
+    
+    
     # Phase 3: cyclic outputs
     x_cycle_a:    Tensor   # (B, T, X, Y, Z)  A→B→A should ≈ x_a
     x_cycle_b:    Tensor   # (B, T, X, Y, Z)  B→A→B should ≈ x_b
+    
+    
     # Discriminator patch score maps
-    score_real_b: Tensor   # (B, 1, d, h, w)  D_B on real x_b
-    score_fake_b: Tensor   # (B, 1, d, h, w)  D_B on x_hat_b
-    score_real_a: Tensor   # (B, 1, d, h, w)  D_A on real x_a
-    score_fake_a: Tensor   # (B, 1, d, h, w)  D_A on x_hat_a
+    score_real_b: Tensor   # (B, 1, d, h, w)  D_B on real x_b  (motion free real)
+    score_fake_b: Tensor   # (B, 1, d, h, w)  D_B on x_hat_b.  (motion free fake)
+    score_real_a: Tensor   # (B, 1, d, h, w)  D_A on real x_a. (motion corrupted real)
+    score_fake_a: Tensor   # (B, 1, d, h, w)  D_A on x_hat_a.  (motion corrupted fake)
 
 
-# ---------------------------------------------------------------------------
-# 1. Adversarial loss (LSGAN)
-# ---------------------------------------------------------------------------
+
+# 1. Adversarial discriminator loss (LSGAN)
 def adversarial_loss_discriminator(out: ModelOutputs) -> Dict[str, Tensor]:
     """
     LSGAN discriminator loss.
@@ -80,7 +88,7 @@ def adversarial_loss_discriminator(out: ModelOutputs) -> Dict[str, Tensor]:
 
     return {"D_B": L_D_B, "D_A": L_D_A, "total": L_D_B + L_D_A}
 
-
+# Adversarial generator loss (LSGAN)
 def adversarial_loss_generator(out: ModelOutputs) -> Tensor:
     """
     LSGAN generator loss.
@@ -93,9 +101,7 @@ def adversarial_loss_generator(out: ModelOutputs) -> Tensor:
             0.5 * F.mse_loss(out.score_fake_a, ones_a))
 
 
-# ---------------------------------------------------------------------------
 # 2. Cycle-consistency loss (L1)
-# ---------------------------------------------------------------------------
 def cycle_consistency_loss(out: ModelOutputs,
                             x_a: Tensor,
                             x_b: Tensor) -> Tensor:
@@ -106,9 +112,8 @@ def cycle_consistency_loss(out: ModelOutputs,
     return F.l1_loss(out.x_cycle_a, x_a) + F.l1_loss(out.x_cycle_b, x_b)
 
 
-# ---------------------------------------------------------------------------
+
 # 3. Identity / self-reconstruction loss (L1)
-# ---------------------------------------------------------------------------
 def identity_loss(out: ModelOutputs,
                   x_a: Tensor,
                   x_b: Tensor) -> Tensor:
@@ -119,9 +124,7 @@ def identity_loss(out: ModelOutputs,
     return F.l1_loss(out.x_self_a, x_a) + F.l1_loss(out.x_self_b, x_b)
 
 
-# ---------------------------------------------------------------------------
 # 4. Content consistency loss (MSE in feature space)
-# ---------------------------------------------------------------------------
 def content_loss(out: ModelOutputs) -> Tensor:
     """
     MSE on content feature maps.
@@ -132,9 +135,7 @@ def content_loss(out: ModelOutputs) -> Tensor:
             F.mse_loss(out.c_hat_a, out.c_b.detach()))
 
 
-# ---------------------------------------------------------------------------
 # 5. Artefact suppression loss (MSE → 0)
-# ---------------------------------------------------------------------------
 def artefact_suppression_loss(out: ModelOutputs) -> Tensor:
     """
     Pushes artefact codes from clean chunks x_b toward zero.
@@ -144,9 +145,8 @@ def artefact_suppression_loss(out: ModelOutputs) -> Tensor:
             F.mse_loss(out.a_spatial_b, torch.zeros_like(out.a_spatial_b)))
 
 
-# ---------------------------------------------------------------------------
+
 # Combined losses
-# ---------------------------------------------------------------------------
 def generator_loss(out: ModelOutputs,
                    x_a: Tensor,
                    x_b: Tensor,
@@ -187,14 +187,13 @@ def discriminator_loss(out: ModelOutputs) -> Dict[str, Tensor]:
 
 
 
-# ---------------------------------------------------------------------------
+
 # Sanity checks
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
 
     torch.manual_seed(0)
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Dummy dimensions — match your actual data
     B, T, X, Y, Z   = 2, 20, 97, 116, 79
