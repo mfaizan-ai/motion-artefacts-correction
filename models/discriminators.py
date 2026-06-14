@@ -29,7 +29,7 @@ This single discrimintor coudl be used for both domains (motion-corrupted and cl
 
 import torch
 from torch import nn
-from building_blocks import DiscConvBlock, append_temporal_diffs
+from models.building_blocks import DiscConvBlock, append_temporal_diffs
 
 class PatchDiscriminator3D(nn.Module):
     """

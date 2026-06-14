@@ -27,9 +27,9 @@ import torch
 import torch.nn as nn
 
 # Local component imports 
-from encoders       import ContentEncoder,   ArtefactEncoder
-from decoders       import MotionFreeDecoder, MotionCorruptedDecoder
-from discriminators import (MotionFreeDiscriminator,
+from models.encoders       import ContentEncoder,   ArtefactEncoder
+from models.decoders       import MotionFreeDecoder, MotionCorruptedDecoder
+from models.discriminators import (MotionFreeDiscriminator,
                              MotionCorruptedDiscriminator)
 
 

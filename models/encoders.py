@@ -21,7 +21,7 @@ Based on:
 
 import torch
 import torch.nn as nn
-from building_blocks import ResBlock3D, StridedConvBlock
+from models.building_blocks import ResBlock3D, StridedConvBlock
 
 class ContentEncoder(nn.Module):
     """

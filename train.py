@@ -168,7 +168,6 @@ def compute_fmri_metrics(
     }
 
 
-
 # Composite validation score for best-model selection
 # Higher = better.  Penalises over-smoothing.
 def compute_val_score(metrics: Dict[str, float]) -> float:
@@ -191,8 +190,6 @@ def compute_val_score(metrics: Dict[str, float]) -> float:
         score -= (metrics["smoothness_ratio"] - 1.1) * 10.0
 
     return score
-
-
 
 # Scheduler builder
 # Warmup 5 epochs → constant → linear decay to 0 over second half
@@ -362,8 +359,8 @@ def train_one_epoch(
         for p in model.generator_parameters():
             p.requires_grad_(False)
 
-        with torch.no_grad():
-            out_for_disc = model(x_a, x_b)   # scores needed, no gen gradients
+        
+        out_for_disc = model(x_a, x_b)   # scores needed, no gen gradients
 
         d_losses = discriminator_loss(out_for_disc)
         opt_D.zero_grad()
@@ -503,9 +500,9 @@ def parse_args() -> argparse.Namespace:
                 "faizan_motion_correction_dataset/cyclegans_dataset",
         help="Path to cyclegans_dataset/ root")
     p.add_argument("--ckpt_root", type=str,
-        default="/lustre/disk/home/users/mfaizan/motion_correction/checkpoints",
+        default="/lustre/disk/home/users/mfaizan/motion_correction/prototyping/motion-artefacts-correction",
         help="Root directory for checkpoints")
-    p.add_argument("--run_name", type=str, default=None,
+    p.add_argument("--run_name", type=str, default='baseline',
         help="Run name (default: run_<timestamp>)")
     p.add_argument("--resume", type=str, default=None,
         help="Path to checkpoint to resume from (e.g. checkpoints/run_01/latest.pt)")

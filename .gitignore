@@ -2,6 +2,7 @@ logs/
 __pycache__/
 models/__pycache__/
 dataset_build_logs/
+baseline/
 .vscode
 *.pdf
 *.docx

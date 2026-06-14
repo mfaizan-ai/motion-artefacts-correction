@@ -29,7 +29,7 @@ Based on:
 """
 import torch
 import torch.nn as nn
-from building_blocks import ResBlock3D, UpBlock3D, AdaIN3D, AdaINResBlock3D
+from models.building_blocks import ResBlock3D, UpBlock3D, AdaIN3D, AdaINResBlock3D
 
 
 class MotionFreeDecoder(nn.Module):
