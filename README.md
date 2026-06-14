@@ -225,3 +225,16 @@ Cancel a job if needed:
 ```bash
 scancel JOB_ID
 ```
+
+## Evaluation 
+
+Inference and evaluation script for Disentangled CycleGAN fMRI motion artefact correction.
+```bash 
+python test.py --checkpoint /path/to/best_model.pt
+```
+
+Override output location:
+
+```bash
+python test.py --checkpoint /path/to/best_model.pt --data_root /path/to/cyclegans_dataset
+```

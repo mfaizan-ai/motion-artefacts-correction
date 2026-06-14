@@ -11,7 +11,6 @@ Usage:
     Override output location:
     python test.py --checkpoint /path/to/best_model.pt --data_root /path/to/cyclegans_dataset
 """
-
 import argparse
 import csv
 from pathlib import Path
