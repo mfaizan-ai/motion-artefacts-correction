@@ -164,3 +164,64 @@ python dataset.py \
     --workers 4 \
     --batch 1
 ```
+
+## Training
+
+This repository trains a ```Disentangled CycleGAN``` model for fMRI motion artefact correction using unpaired motion-corrupted and motion-free fMRI chunks. The training script builds the ```dataloaders```, ```initializes the model```, ```trains the generators``` and ```discriminators```, ```validates using fMRI quality metrics```, and saves checkpoints for recovery and best-model selection.
+
+### Run training directly
+
+```bash
+python train.py \
+  --data_root /path/to/cyclegans_dataset \
+  --ckpt_root /path/to/save/checkpoints \
+  --run_name baseline_run \
+  --epochs 300 \
+  --batch_size 4 \
+  --num_workers 8 \
+  --in_timepoints 20
+```
+
+### Main arguments
+
+```bash
+--data_root        Path to the CycleGAN dataset root
+--ckpt_root        Directory where checkpoints and logs will be saved
+--run_name         Name of the experiment/run
+--epochs           Number of training epochs
+--batch_size       Batch size
+--num_workers      Number of dataloader workers
+--in_timepoints    Number of fMRI timepoints per chunk
+--resume           Path to checkpoint for resuming training
+--no_wandb         Disable Weights & Biases logging
+```
+
+### Resume training
+
+```bash
+python train.py \
+  --data_root /path/to/cyclegans_dataset \
+  --ckpt_root /path/to/save/checkpoints \
+  --run_name baseline_run \
+  --resume /path/to/save/checkpoints/baseline_run/latest.pt
+```
+
+### Run with Slurm
+
+After creating a Slurm submission script, submit it with:
+
+```bash
+sbatch train.slurm
+```
+
+Check the job status with:
+
+```bash
+squeue -u $USER
+```
+
+Cancel a job if needed:
+
+```bash
+scancel JOB_ID
+```
