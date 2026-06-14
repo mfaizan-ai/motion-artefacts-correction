@@ -211,7 +211,7 @@ python train.py \
 After creating a Slurm submission script, submit it with:
 
 ```bash
-sbatch train.slurm
+sbatch run_train.sh
 ```
 
 Check the job status with:
