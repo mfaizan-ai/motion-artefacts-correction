@@ -513,7 +513,6 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Train Disentangled CycleGAN for fMRI motion correction"
     )
-
     # Paths
     p.add_argument("--data_root", type=str,
         default="/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
@@ -527,7 +526,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", type=str, default=None,
         help="Path to checkpoint to resume from (e.g. checkpoints/run_01/latest.pt)")
 
-    # Training
+    # Training configs 
     p.add_argument("--epochs",      type=int,   default=300)
     p.add_argument("--batch_size",  type=int,   default=4)
     p.add_argument("--num_workers", type=int,   default=8)
@@ -594,7 +593,6 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark     = False
 
-
 def main() -> None:
     args   = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -615,7 +613,7 @@ def main() -> None:
         print(f"VRAM          : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     
-    # WandB — offline mode for compute nodes without internet
+    # WandB, offline mode for compute nodes without internet
     os.environ.setdefault("WANDB_MODE", "offline")
 
     if not args.no_wandb:
@@ -733,7 +731,7 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
 
-        # ---- Train ----
+        #  Train
         epoch_weights = get_epoch_weights(weights, epoch, args.loss_warmup_epochs)
         train_metrics = train_one_epoch(
             model, loaders["train"], opt_G, opt_D, epoch_weights, device, epoch,
@@ -751,7 +749,7 @@ def main() -> None:
         lr_D = sched_D.get_last_lr()[0]
         epoch_time = time.time() - epoch_start
 
-        #  Console summary 
+        # Console summary 
         print(
             f"Epoch {epoch:03d}/{args.epochs}  "
             f"({epoch_time:.0f}s)  "
@@ -765,14 +763,13 @@ def main() -> None:
             f"lr_G={lr_G:.2e}"
         )
 
-        # ---- CSV ----
+        # CSV 
         train_csv.write({
             "epoch": epoch,
             "lr_G":  lr_G,
             "lr_D":  lr_D,
             **{k: f"{v:.6f}" for k, v in train_metrics.items()},
         })
-
         #  WandB train 
         if not args.no_wandb:
             wandb.log({
@@ -782,7 +779,7 @@ def main() -> None:
                 **{f"train/{k}": v for k, v in train_metrics.items()},
             }, step=epoch)
 
-        # ---- Validation ----
+        #  Validation 
         if epoch % args.val_every == 0:
             val_metrics = validate(
                 model, loaders["val"], epoch_weights, device, epoch
@@ -803,8 +800,7 @@ def main() -> None:
                 f"DVARS↓={val_metrics['val_dvars_improvement']:+.4f}  "
                 f"GS_std↓={val_metrics['val_gs_std_improvement']:+.4f}  "
                 f"smooth={val_metrics['val_smoothness_ratio']:.3f}  "
-                f"score={val_score:.4f}"
-            )
+                f"score={val_score:.4f}")
 
             # CSV
             val_csv.write({"epoch": epoch,
@@ -825,14 +821,14 @@ def main() -> None:
                                 best_score, args)
                 print(f"  [VAL]  ✓ New best score={best_score:.4f}  saved → {best_path}")
 
-        # ---- Numbered checkpoint every save_every epochs ----
+        # Numbered checkpoint every save_every epochs 
         if epoch % args.save_every == 0:
             numbered = run_dir / f"epoch_{epoch:03d}.pt"
             save_checkpoint(numbered, epoch, model,
                             opt_G, opt_D, sched_G, sched_D,
                             best_score, args)
 
-        # ---- Latest checkpoint every epoch (crash recovery) ----
+        #  Latest checkpoint every epoch (crash recovery)
         save_checkpoint(run_dir / "latest.pt", epoch, model,
                         opt_G, opt_D, sched_G, sched_D,
                         best_score, args)
