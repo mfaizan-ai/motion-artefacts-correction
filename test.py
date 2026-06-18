@@ -107,7 +107,6 @@ def compute_all_metrics(
     metrics["gs_std_improvement"]     = metrics["gs_std_input"]     - metrics["gs_std_corrected"]
     metrics["smoothness_ratio"]       = (metrics["smoothness_corrected"]
                                          / (metrics["smoothness_input"] + 1e-8))
-
     return metrics
 
 
@@ -417,7 +416,6 @@ def plot_carpet_comparison(
             out_path = subdir / f"{chunk_name}_{tag}_carpet.png",
         )
 
-
 def plot_mean_std_maps(
     chunk_data: Dict,
     chunk_name: str,
@@ -469,6 +467,8 @@ def plot_mean_std_maps(
         plt.savefig(subdir / f"{chunk_name}_{stat}.png",
                     dpi=300, bbox_inches="tight")
         plt.close()
+
+
 
 
 def parse_args() -> argparse.Namespace:
