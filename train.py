@@ -331,7 +331,6 @@ def get_epoch_weights(
         art     = base_weights.art,
     )
 
-
 def train_one_epoch(
     model:    DisentangledCycleGAN,
     loader,
@@ -442,7 +441,6 @@ def train_one_epoch(
         for k in ["D_A", "D_B", "D_total"]:
             result[k] = acc[k] / n_d_updates
     return result
-
 
 
 # Validation epoch
@@ -592,7 +590,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-
 # Reproducibility
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -602,6 +599,7 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark     = False
+
 
 def main() -> None:
     args   = parse_args()
@@ -852,7 +850,6 @@ def main() -> None:
     if not args.no_wandb:
         wandb.finish()
         print(f"Sync WandB with: wandb sync {run_dir}/wandb/")
-
 
 if __name__ == "__main__":
     main()
