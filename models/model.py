@@ -32,8 +32,6 @@ from models.decoders       import MotionFreeDecoder, MotionCorruptedDecoder
 from models.discriminators import (MotionFreeDiscriminator,
                              MotionCorruptedDiscriminator)
 
-
-
 # Model outputs dataclass to hold all intermediate tensors from a forward pass
 @dataclass
 class ModelOutputs:
@@ -81,7 +79,6 @@ class ModelOutputs:
     score_fake_b : torch.Tensor  # (B, 1, 5, 6, 4)  D_B on x_hat_b
     score_real_a : torch.Tensor  # (B, 1, 5, 6, 4)  D_A on real x_a
     score_fake_a : torch.Tensor  # (B, 1, 5, 6, 4)  D_A on x_hat_a
-
 
 # Distengled CycleGAN model for fMRI motion artefact correction
 class DisentangledCycleGAN(nn.Module):
@@ -208,7 +205,8 @@ class DisentangledCycleGAN(nn.Module):
     #  Main forward pass 
     def forward(self,
                 x_a: torch.Tensor,
-                x_b: torch.Tensor) -> ModelOutputs:
+                x_b: torch.Tensor,
+                detach_fakes_for_D: bool = False) -> ModelOutputs:
         """
         Full Dr-CycleGAN forward pass.
 
@@ -278,13 +276,17 @@ class DisentangledCycleGAN(nn.Module):
     
         # DISCRIMINATOR SCORES
 
+        # Detach fakes during D update to save memory
+        fake_b_for_D = x_hat_b.detach() if detach_fakes_for_D else x_hat_b
+        fake_a_for_D = x_hat_a.detach() if detach_fakes_for_D else x_hat_a
+
         # D_B: judges motion-free domain
-        score_real_b = self.D_B(x_b)          # real motion-free
-        score_fake_b = self.D_B(x_hat_b)      # predicted clean
+        score_real_b = self.D_B(x_b)
+        score_fake_b = self.D_B(fake_b_for_D)
 
         # D_A: judges corrupted domain
-        score_real_a = self.D_A(x_a)          # real corrupted
-        score_fake_a = self.D_A(x_hat_a)      # predicted corrupted
+        score_real_a = self.D_A(x_a)
+        score_fake_a = self.D_A(fake_a_for_D)
 
         return ModelOutputs(
             # Phase 1

@@ -70,21 +70,23 @@ class ModelOutputs:
 
 
 # 1. Adversarial discriminator loss (LSGAN)
-def adversarial_loss_discriminator(out: ModelOutputs) -> Dict[str, Tensor]:
+def adversarial_loss_discriminator(out: ModelOutputs,
+                                    real_target: float = 1.0,
+                                    fake_target: float = 0.0) -> Dict[str, Tensor]:
     """
-    LSGAN discriminator loss.
-    Real → 1, fake → 0 for both D_A and D_B.
+    LSGAN discriminator loss with label smoothing.
+    Real → real_target, fake → fake_target for both D_A and D_B.
     """
-    ones_b  = torch.ones_like(out.score_real_b)
-    zeros_b = torch.zeros_like(out.score_fake_b)
-    ones_a  = torch.ones_like(out.score_real_a)
-    zeros_a = torch.zeros_like(out.score_fake_a)
+    real_b = torch.full_like(out.score_real_b, real_target)
+    fake_b = torch.full_like(out.score_fake_b, fake_target)
+    real_a = torch.full_like(out.score_real_a, real_target)
+    fake_a = torch.full_like(out.score_fake_a, fake_target)
 
-    L_D_B = (0.5 * F.mse_loss(out.score_real_b, ones_b) +
-             0.5 * F.mse_loss(out.score_fake_b, zeros_b))
+    L_D_B = (0.5 * F.mse_loss(out.score_real_b, real_b) +
+             0.5 * F.mse_loss(out.score_fake_b, fake_b))
 
-    L_D_A = (0.5 * F.mse_loss(out.score_real_a, ones_a) +
-             0.5 * F.mse_loss(out.score_fake_a, zeros_a))
+    L_D_A = (0.5 * F.mse_loss(out.score_real_a, real_a) +
+             0.5 * F.mse_loss(out.score_fake_a, fake_a))
 
     return {"D_B": L_D_B, "D_A": L_D_A, "total": L_D_B + L_D_A}
 
@@ -177,12 +179,14 @@ def generator_loss(out: ModelOutputs,
     }
 
 
-def discriminator_loss(out: ModelOutputs) -> Dict[str, Tensor]:
+def discriminator_loss(out: ModelOutputs,
+                       real_target: float = 1.0,
+                       fake_target: float = 0.0) -> Dict[str, Tensor]:
     """
-    Combined discriminator loss.
+    Combined discriminator loss with label smoothing.
     Returns dict with D_A, D_B and 'total' for .backward().
     """
-    return adversarial_loss_discriminator(out)
+    return adversarial_loss_discriminator(out, real_target, fake_target)
 
 
 

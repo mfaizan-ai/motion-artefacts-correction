@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=36:00:00
+#SBATCH --time=72:00:00
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 
@@ -20,4 +20,4 @@ python -u train.py \
     --epochs 300 \
     --batch_size 4 \
     --num_workers 8 \
-    --run_name baseline
+    --run_name fix_v1

@@ -4,7 +4,6 @@ train.py
 ========
 Training script for Disentangled CycleGAN fMRI motion artefact correction.
 """
-
 import argparse
 import csv
 import os
@@ -315,7 +314,24 @@ class CSVLogger:
 
 
 
-# Single training epoch
+def get_epoch_weights(
+    base_weights: LossWeights,
+    epoch:        int,
+    warmup_epochs: int,
+) -> LossWeights:
+    """Linearly ramp cycle/identity weights from 1.0 to full value."""
+    if warmup_epochs <= 0 or epoch >= warmup_epochs:
+        return base_weights
+    t = epoch / warmup_epochs
+    return LossWeights(
+        adv     = base_weights.adv,
+        cyc     = 1.0 + (base_weights.cyc - 1.0) * t,
+        idt     = 1.0 + (base_weights.idt - 1.0) * t,
+        content = base_weights.content,
+        art     = base_weights.art,
+    )
+
+
 def train_one_epoch(
     model:    DisentangledCycleGAN,
     loader,
@@ -324,6 +340,10 @@ def train_one_epoch(
     weights:  LossWeights,
     device:   torch.device,
     epoch:    int,
+    max_grad_norm:     float = 10.0,
+    d_update_every:    int   = 1,
+    label_smooth_real: float = 1.0,
+    label_smooth_fake: float = 0.0,
 ) -> Dict[str, float]:
     """
     Run one full training epoch.
@@ -339,6 +359,7 @@ def train_one_epoch(
             "score_real_a", "score_fake_a",
             "score_real_b", "score_fake_b"]}
     n_batches = 0
+    n_d_updates = 0
 
     # Advance A queue at the start of each epoch
     loader.dataset.on_epoch_start()
@@ -348,24 +369,33 @@ def train_one_epoch(
                 leave=False,
                 dynamic_ncols=True)
 
-    for batch in pbar:
+    last_d_a = 0.0
+    last_d_b = 0.0
+
+    for i, batch in enumerate(pbar):
         x_a = batch["A"].to(device)   # (B, T, X, Y, Z)  corrupted
         x_b = batch["B"].to(device)   # (B, T, X, Y, Z)  motion-free
 
-    
-        # Step 1 — Update discriminators
-        for p in model.discriminator_parameters():
-            p.requires_grad_(True)
-        for p in model.generator_parameters():
-            p.requires_grad_(False)
+        # Step 1 — Update discriminators (every d_update_every steps)
+        if i % d_update_every == 0:
+            for p in model.discriminator_parameters():
+                p.requires_grad_(True)
+            for p in model.generator_parameters():
+                p.requires_grad_(False)
 
-        
-        out_for_disc = model(x_a, x_b)   # scores needed, no gen gradients
+            out_for_disc = model(x_a, x_b, detach_fakes_for_D=True)
 
-        d_losses = discriminator_loss(out_for_disc)
-        opt_D.zero_grad()
-        d_losses["total"].backward()
-        opt_D.step()
+            d_losses = discriminator_loss(out_for_disc, label_smooth_real, label_smooth_fake)
+            opt_D.zero_grad()
+            d_losses["total"].backward()
+            opt_D.step()
+
+            last_d_a = d_losses["D_A"].item()
+            last_d_b = d_losses["D_B"].item()
+            acc["D_A"]     += last_d_a
+            acc["D_B"]     += last_d_b
+            acc["D_total"] += d_losses["total"].item()
+            n_d_updates += 1
 
         # Step 2 — Update generators + encoders
         for p in model.discriminator_parameters():
@@ -373,19 +403,17 @@ def train_one_epoch(
         for p in model.generator_parameters():
             p.requires_grad_(True)
 
-        out = model(x_a, x_b)
+        out = model(x_a, x_b, detach_fakes_for_D=False)
         g_losses = generator_loss(out, x_a, x_b, weights)
         opt_G.zero_grad()
         g_losses["total"].backward()
 
-        # Gradient clipping — generators only, norm=1.0
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.generator_parameters(), max_norm=1.0
+            model.generator_parameters(), max_norm=max_grad_norm
         ).item()
 
         opt_G.step()
 
-        
         # Accumulate
         acc["G_adv"]     += g_losses["adv"].item()
         acc["G_cyc"]     += g_losses["cyc"].item()
@@ -393,9 +421,6 @@ def train_one_epoch(
         acc["G_content"] += g_losses["content"].item()
         acc["G_art"]     += g_losses["art"].item()
         acc["G_total"]   += g_losses["total"].item()
-        acc["D_A"]       += d_losses["D_A"].item()
-        acc["D_B"]       += d_losses["D_B"].item()
-        acc["D_total"]   += d_losses["total"].item()
         acc["grad_norm_G"] += grad_norm
         acc["score_real_a"] += out.score_real_a.mean().item()
         acc["score_fake_a"] += out.score_fake_a.mean().item()
@@ -403,17 +428,20 @@ def train_one_epoch(
         acc["score_fake_b"] += out.score_fake_b.mean().item()
         n_batches += 1
 
-        # tqdm postfix — show key losses live
         pbar.set_postfix({
             "G":    f"{g_losses['total'].item():.3f}",
             "cyc":  f"{g_losses['cyc'].item():.3f}",
             "idt":  f"{g_losses['idt'].item():.3f}",
-            "D_A":  f"{d_losses['D_A'].item():.3f}",
-            "D_B":  f"{d_losses['D_B'].item():.3f}",
+            "D_A":  f"{last_d_a:.3f}",
+            "D_B":  f"{last_d_b:.3f}",
             "∇G":   f"{grad_norm:.2f}",
         })
 
-    return {k: v / n_batches for k, v in acc.items()}
+    result = {k: v / max(n_batches, 1) for k, v in acc.items()}
+    if n_d_updates > 0:
+        for k in ["D_A", "D_B", "D_total"]:
+            result[k] = acc[k] / n_d_updates
+    return result
 
 
 
@@ -521,16 +549,28 @@ def parse_args() -> argparse.Namespace:
 
     # Optimiser
     p.add_argument("--lr_G",   type=float, default=2e-4, help="Generator LR")
-    p.add_argument("--lr_D",   type=float, default=1e-4, help="Discriminator LR")
+    p.add_argument("--lr_D",   type=float, default=5e-5, help="Discriminator LR")
     p.add_argument("--beta1",  type=float, default=0.5)
     p.add_argument("--beta2",  type=float, default=0.999)
 
     # Loss weights
     p.add_argument("--w_adv",     type=float, default=1.0)
-    p.add_argument("--w_cyc",     type=float, default=20.0)
-    p.add_argument("--w_idt",     type=float, default=20.0)
-    p.add_argument("--w_content", type=float, default=0.5)
+    p.add_argument("--w_cyc",     type=float, default=10.0)
+    p.add_argument("--w_idt",     type=float, default=5.0)
+    p.add_argument("--w_content", type=float, default=0.0)
     p.add_argument("--w_art",     type=float, default=0.1)
+
+    # Training stabilisation
+    p.add_argument("--max_grad_norm",     type=float, default=10.0,
+        help="Generator gradient clip max norm")
+    p.add_argument("--d_update_every",    type=int,   default=2,
+        help="Update discriminator every N batches")
+    p.add_argument("--label_smooth_real", type=float, default=0.9,
+        help="Label smoothing target for real samples")
+    p.add_argument("--label_smooth_fake", type=float, default=0.1,
+        help="Label smoothing target for fake samples")
+    p.add_argument("--loss_warmup_epochs", type=int,  default=20,
+        help="Epochs to linearly ramp cycle/identity weights from 1.0 to full")
 
     # Model
     p.add_argument("--in_timepoints",    type=int, default=20)
@@ -704,8 +744,13 @@ def main() -> None:
         epoch_start = time.time()
 
         # ---- Train ----
+        epoch_weights = get_epoch_weights(weights, epoch, args.loss_warmup_epochs)
         train_metrics = train_one_epoch(
-            model, loaders["train"], opt_G, opt_D, weights, device, epoch
+            model, loaders["train"], opt_G, opt_D, epoch_weights, device, epoch,
+            max_grad_norm=args.max_grad_norm,
+            d_update_every=args.d_update_every,
+            label_smooth_real=args.label_smooth_real,
+            label_smooth_fake=args.label_smooth_fake,
         )
 
         # Step schedulers
@@ -750,7 +795,7 @@ def main() -> None:
         # ---- Validation ----
         if epoch % args.val_every == 0:
             val_metrics = validate(
-                model, loaders["val"], weights, device, epoch
+                model, loaders["val"], epoch_weights, device, epoch
             )
             val_score = compute_val_score({
                 k.replace("val_", ""): v
