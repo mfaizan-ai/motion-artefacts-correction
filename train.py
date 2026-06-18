@@ -781,7 +781,7 @@ def main() -> None:
             **{k: f"{v:.6f}" for k, v in train_metrics.items()},
         })
 
-        # ---- WandB train ----
+        #  WandB train 
         if not args.no_wandb:
             wandb.log({
                 "epoch": epoch,
