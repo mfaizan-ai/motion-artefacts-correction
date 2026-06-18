@@ -308,6 +308,7 @@ class CSVLogger:
             writer.writerow({k: row.get(k, "") for k in self.fieldnames})
 
 
+#get epoch weights
 def get_epoch_weights(
     base_weights: LossWeights,
     epoch:        int,
