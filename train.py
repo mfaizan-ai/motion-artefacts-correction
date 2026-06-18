@@ -288,7 +288,6 @@ def load_checkpoint(
     print(f"  Resumed from epoch {ckpt['epoch']}  best_score={ckpt['best_score']:.4f}")
     return ckpt["epoch"] + 1, ckpt["best_score"]
 
-
 # CSV logger
 class CSVLogger:
     """Appends one row per call to a CSV file. Creates file + header on init."""
@@ -308,7 +307,7 @@ class CSVLogger:
             writer.writerow({k: row.get(k, "") for k in self.fieldnames})
 
 
-#get epoch weights
+# get epoch weights
 def get_epoch_weights(
     base_weights: LossWeights,
     epoch:        int,
@@ -553,7 +552,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w_content", type=float, default=0.0)
     p.add_argument("--w_art",     type=float, default=0.1)
 
-    # Training stabilisation
+    # Training stabilisation of the discriminator
     p.add_argument("--max_grad_norm",     type=float, default=10.0,
         help="Generator gradient clip max norm")
     p.add_argument("--d_update_every",    type=int,   default=2,
@@ -565,7 +564,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loss_warmup_epochs", type=int,  default=20,
         help="Epochs to linearly ramp cycle/identity weights from 1.0 to full")
 
-    # Model
+    # Model configurations 
     p.add_argument("--in_timepoints",    type=int, default=20)
     p.add_argument("--content_ch",       type=int, default=384)
     p.add_argument("--content_base_ch",  type=int, default=64)
@@ -575,7 +574,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--spatial_code_ch",  type=int, default=32)
     p.add_argument("--disc_base_ch",     type=int, default=64)
 
-    # WandB
+    # WandB logging
     p.add_argument("--wandb_project", type=str, default="fmri-motion-correction")
     p.add_argument("--wandb_entity",  type=str, default=None,
         help="WandB username or team (leave None to use default)")
