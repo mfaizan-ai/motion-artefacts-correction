@@ -189,9 +189,6 @@ def discriminator_loss(out: ModelOutputs,
     return adversarial_loss_discriminator(out, real_target, fake_target)
 
 
-
-
-
 # Sanity checks
 if __name__ == "__main__":
     import sys
