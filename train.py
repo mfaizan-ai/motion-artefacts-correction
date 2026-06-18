@@ -28,12 +28,10 @@ from losses  import (generator_loss, discriminator_loss,        # losses.py
 from models.model import DisentangledCycleGAN                 
 
 
-
 # fMRI quality metrics
 def compute_dvars(x: torch.Tensor) -> float:
     """
     DVARS — RMS of the temporal derivative of the global signal.
-
     For each timepoint t > 0:
         dvars(t) = sqrt( mean( (x[:,t,...] - x[:,t-1,...])^2 ) )
     Returns the mean DVARS across all timepoints and batch items.
@@ -166,7 +164,6 @@ def compute_fmri_metrics(
         "smoothness_ratio":   sm_out / (sm_in + 1e-8),   # <1 fine, >1.1 = over-smooth
     }
 
-
 # Composite validation score for best-model selection
 # Higher = better.  Penalises over-smoothing.
 def compute_val_score(metrics: Dict[str, float]) -> float:
@@ -231,7 +228,6 @@ def build_scheduler(optimiser: Adam,
                         schedulers  = [s_warmup, s_constant, s_decay],
                         milestones  = [warmup, warmup + half])
 
-
 # Checkpoint helpers
 def save_checkpoint(
     path:       Path,
@@ -293,7 +289,6 @@ def load_checkpoint(
     return ckpt["epoch"] + 1, ckpt["best_score"]
 
 
-
 # CSV logger
 class CSVLogger:
     """Appends one row per call to a CSV file. Creates file + header on init."""
@@ -311,7 +306,6 @@ class CSVLogger:
                 writer.writeheader()
                 self._exists = True
             writer.writerow({k: row.get(k, "") for k in self.fieldnames})
-
 
 
 def get_epoch_weights(
