@@ -603,7 +603,6 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark     = False
 
-
 def main() -> None:
     args   = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -668,9 +667,8 @@ def main() -> None:
         batch_size    = args.batch_size,
         num_workers   = args.num_workers,
         pin_memory    = True,
-        augment_train = True,
-    )
-
+        augment_train = True)
+    
     # Model
     print("Building model ...")
     model = DisentangledCycleGAN(
@@ -761,7 +759,7 @@ def main() -> None:
         lr_D = sched_D.get_last_lr()[0]
         epoch_time = time.time() - epoch_start
 
-        # ---- Console summary ----
+        #  Console summary 
         print(
             f"Epoch {epoch:03d}/{args.epochs}  "
             f"({epoch_time:.0f}s)  "
