@@ -374,8 +374,6 @@ class ValFMRIDataset(Dataset):
             "path_B":       path_B,
         }
 
-
-
 # Test dataset  
 class TestFMRIDataset(Dataset):
     """
@@ -423,7 +421,6 @@ class TestFMRIDataset(Dataset):
             "orig_shape_A": orig_shape,
             "path_A":       path,
         }
-
 
 
 # DataLoader factory
@@ -526,7 +523,6 @@ def build_dataloaders(
 
     return loaders
 
-
 if __name__ == "__main__":
     import argparse
     from collections import Counter
@@ -556,7 +552,7 @@ if __name__ == "__main__":
         pin_memory=torch.cuda.is_available(),
         augment_train=True,
     )
-    
+
     train_loader = loaders.get("train", None)
     batch = next(iter(train_loader))
     psc_A = batch["A"]
