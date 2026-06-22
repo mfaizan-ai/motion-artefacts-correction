@@ -115,13 +115,16 @@ class DisentangledCycleGAN(nn.Module):
                  artefact_base_ch: int   = 64,
                  global_code_dim:  int   = 64,
                  spatial_code_ch:  int   = 32,
-                 disc_base_ch:     int   = 64):
+                 disc_base_ch:     int   = 64,
+                 disc_temporal_diffs: bool = True,
+                 residual:         bool  = False):
         super().__init__()
 
         self.in_timepoints  = in_timepoints
         self.spatial_dims   = spatial_dims
         self.global_code_dim = global_code_dim
         self.spatial_code_ch = spatial_code_ch
+        self.residual        = residual
 
         #  Content encoder — shared across both domains
         self.E_c = ContentEncoder(
@@ -130,7 +133,7 @@ class DisentangledCycleGAN(nn.Module):
             n_res_blocks  = content_n_res,
         )
 
-        #  Artefact encoder 
+        #  Artefact encoder
         self.E_a = ArtefactEncoder(
             in_channels     = in_timepoints,
             base_channels   = artefact_base_ch,
@@ -138,14 +141,14 @@ class DisentangledCycleGAN(nn.Module):
             spatial_code_ch = spatial_code_ch,
         )
 
-        #  Motion-free decoder G_B 
+        #  Motion-free decoder G_B
         self.G_B = MotionFreeDecoder(
             content_ch   = content_ch,
             out_channels = in_timepoints,
             n_res_blocks = 4,
         )
 
-        #  Motion-corrupted decoder G_A 
+        #  Motion-corrupted decoder G_A
         self.G_A = MotionCorruptedDecoder(
             content_ch     = content_ch,
             artefact_dim   = global_code_dim,
@@ -154,14 +157,16 @@ class DisentangledCycleGAN(nn.Module):
             n_adain_blocks = 4,
         )
 
-        #  Discriminators 
+        #  Discriminators
         self.D_B = MotionFreeDiscriminator(
             in_timepoints = in_timepoints,
             base_ch       = disc_base_ch,
+            use_temporal_diffs = disc_temporal_diffs,
         )
         self.D_A = MotionCorruptedDiscriminator(
             in_timepoints = in_timepoints,
             base_ch       = disc_base_ch,
+            use_temporal_diffs = disc_temporal_diffs,
         )
 
     # Convenience: parameter groups for separate optimisers
@@ -246,12 +251,18 @@ class DisentangledCycleGAN(nn.Module):
         x_hat_a = self.G_A(c_b, a_global, a_spatial)
 
         # A → A : self-reconstruct corrupted input
-        # Same content + same artefact should reproduce x_a 
+        # Same content + same artefact should reproduce x_a
         x_self_a = self.G_A(c_a, a_global, a_spatial)
 
         # B → B : self-reconstruct clean input
-        # Content encoder + clean decoder should reproduce x_b 
+        # Content encoder + clean decoder should reproduce x_b
         x_self_b = self.G_B(c_b)
+
+        if self.residual:
+            x_hat_b  = x_a + x_hat_b
+            x_hat_a  = x_b + x_hat_a
+            x_self_a = x_a + x_self_a
+            x_self_b = x_b + x_self_b
 
 
         # PHASE 3 — CYCLIC TRANSLATION
@@ -272,6 +283,10 @@ class DisentangledCycleGAN(nn.Module):
         # B→A→B cycle: content from x_hat_a decoded cleanly
         # Should recover x_b
         x_cycle_b = self.G_B(c_hat_a)
+
+        if self.residual:
+            x_cycle_a = x_hat_b + x_cycle_a
+            x_cycle_b = x_hat_a + x_cycle_b
 
     
         # DISCRIMINATOR SCORES
@@ -333,7 +348,10 @@ class DisentangledCycleGAN(nn.Module):
         x_hat_b : (B, T, D, H, W)   predicted motion-free chunk
         """
         c_a = self.E_c(x_a)
-        return self.G_B(c_a)
+        out = self.G_B(c_a)
+        if self.residual:
+            out = x_a + out
+        return out
 
     #  Parameter count summary 
     def count_parameters(self) -> dict:

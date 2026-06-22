@@ -2,6 +2,14 @@ logs/
 __pycache__/
 models/__pycache__/
 dataset_build_logs/
+dataset/chunk-5/
+experiment_records/
+fix_v1/
+fix_v2/
+fix_v3/
+qc_results/
+dataset_quality_check/chunk5/
+
 baseline/
 .vscode
 *.pdf

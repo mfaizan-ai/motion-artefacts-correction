@@ -15,6 +15,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 from torch.optim import Adam
 from torch.optim.lr_scheduler import SequentialLR, ConstantLR, LinearLR
@@ -64,14 +65,13 @@ def compute_tsnr(x: torch.Tensor) -> float:
     Returns:
         float  mean tSNR
     """
-    mean = x.mean(dim=1)                        #(B, X, Y, Z)
-    std  = x.std(dim=1).clamp(min=1e-6)        # (B, X, Y, Z)  avoid /0
-    tsnr = mean.abs() / std                     # (B, X, Y, Z)
-    # Mask: only brain voxels (non-zero mean across T)
-    brain = mean.abs() > 0
-    if brain.sum() == 0:
+    mean = x.mean(dim=1)                        # (B, X, Y, Z)
+    std  = x.std(dim=1)                         # (B, X, Y, Z)
+    valid = std > 1e-3                          # exclude constant voxels (PSC-zeroed boundaries)
+    if valid.sum() == 0:
         return 0.0
-    return tsnr[brain].mean().item()
+    tsnr = mean[valid].abs() / std[valid]
+    return tsnr.mean().item()
 
 
 def compute_global_signal_std(x: torch.Tensor) -> float:
@@ -114,6 +114,21 @@ def compute_spatial_smoothness(x: torch.Tensor) -> float:
     grad_z = (x[:, :, :, :, 1:] - x[:, :, :, :, :-1]).abs()
     smoothness = (grad_x.mean() + grad_y.mean() + grad_z.mean()) / 3.0
     return smoothness.item()
+
+
+def r1_gradient_penalty(
+    discriminator: nn.Module,
+    real_samples: torch.Tensor,
+) -> torch.Tensor:
+    real_samples = real_samples.detach().requires_grad_(True)
+    d_real = discriminator(real_samples)
+    grad_real = torch.autograd.grad(
+        outputs=d_real.sum(),
+        inputs=real_samples,
+        create_graph=True,
+    )[0]
+    penalty = grad_real.pow(2).reshape(grad_real.size(0), -1).sum(dim=1).mean()
+    return penalty
 
 
 def compute_fmri_metrics(
@@ -166,24 +181,15 @@ def compute_fmri_metrics(
 
 # Composite validation score for best-model selection
 # Higher = better.  Penalises over-smoothing.
+# Each term is normalised by the expected ideal improvement (from QC stats)
+# so all three contribute roughly equally (~1.0 each for perfect correction).
 def compute_val_score(metrics: Dict[str, float]) -> float:
-    """
-    Composite score for best-model checkpoint selection.
-
-    Rewards:
-        tSNR improvement    — primary signal quality metric
-        DVARS improvement   — artefact reduction
-        GS std improvement  — global signal stability
-
-    Penalises:
-        smoothness_ratio > 1.1  — over-smoothing destroys spatial structure
-    """
-    score = (metrics["tsnr_improvement"]
-             + metrics["dvars_improvement"]
-             + metrics["gs_std_improvement"])
+    score = (metrics["tsnr_improvement"] / 100.0
+             + metrics["dvars_improvement"] / 3.0
+             + metrics["gs_std_improvement"] / 0.3)
 
     if metrics["smoothness_ratio"] > 1.1:
-        score -= (metrics["smoothness_ratio"] - 1.1) * 10.0
+        score -= (metrics["smoothness_ratio"] - 1.1) * 2.0
 
     return score
 
@@ -272,7 +278,7 @@ def load_checkpoint(
     Returns:
         (start_epoch, best_score)
     """
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     opt_G.load_state_dict(ckpt["opt_G"])
     opt_D.load_state_dict(ckpt["opt_D"])
@@ -325,6 +331,34 @@ def get_epoch_weights(
         art     = base_weights.art,
     )
 
+class ReplayBuffer:
+    """
+    Stores past generator fakes for discriminator training stability.
+    On each push_and_pop call, each sample in the batch has a 50% chance
+    of being swapped with a historical fake from the buffer.
+    Stored on CPU to save GPU memory.
+    """
+    def __init__(self, max_size: int = 50):
+        self.max_size = max_size
+        self.data: list = []
+
+    def push_and_pop(self, x: torch.Tensor) -> torch.Tensor:
+        out = []
+        for i in range(x.size(0)):
+            item = x[i].unsqueeze(0).detach().cpu()
+            if len(self.data) < self.max_size:
+                self.data.append(item.clone())
+                out.append(item)
+            elif random.random() > 0.5:
+                idx = random.randint(0, self.max_size - 1)
+                old = self.data[idx].clone()
+                self.data[idx] = item.clone()
+                out.append(old)
+            else:
+                out.append(item)
+        return torch.cat(out, dim=0)
+
+
 def train_one_epoch(
     model:    DisentangledCycleGAN,
     loader,
@@ -337,6 +371,10 @@ def train_one_epoch(
     d_update_every:    int   = 1,
     label_smooth_real: float = 1.0,
     label_smooth_fake: float = 0.0,
+    replay_buffer_a:   Optional['ReplayBuffer'] = None,
+    replay_buffer_b:   Optional['ReplayBuffer'] = None,
+    r1_weight:         float = 0.0,
+    r1_every:          int   = 8,
 ) -> Dict[str, float]:
     """
     Run one full training epoch.
@@ -348,11 +386,12 @@ def train_one_epoch(
     # Accumulators
     acc = {k: 0.0 for k in
            ["G_adv", "G_cyc", "G_idt", "G_content", "G_art", "G_total",
-            "D_A", "D_B", "D_total", "grad_norm_G",
+            "D_A", "D_B", "D_total", "D_r1", "grad_norm_G",
             "score_real_a", "score_fake_a",
             "score_real_b", "score_fake_b"]}
     n_batches = 0
     n_d_updates = 0
+    n_r1_updates = 0
 
     # Advance A queue at the start of each epoch
     loader.dataset.on_epoch_start()
@@ -369,28 +408,7 @@ def train_one_epoch(
         x_a = batch["A"].to(device)   # (B, T, X, Y, Z)  corrupted
         x_b = batch["B"].to(device)   # (B, T, X, Y, Z)  motion-free
 
-        # Step 1 — Update discriminators (every d_update_every steps)
-        if i % d_update_every == 0:
-            for p in model.discriminator_parameters():
-                p.requires_grad_(True)
-            for p in model.generator_parameters():
-                p.requires_grad_(False)
-
-            out_for_disc = model(x_a, x_b, detach_fakes_for_D=True)
-
-            d_losses = discriminator_loss(out_for_disc, label_smooth_real, label_smooth_fake)
-            opt_D.zero_grad()
-            d_losses["total"].backward()
-            opt_D.step()
-
-            last_d_a = d_losses["D_A"].item()
-            last_d_b = d_losses["D_B"].item()
-            acc["D_A"]     += last_d_a
-            acc["D_B"]     += last_d_b
-            acc["D_total"] += d_losses["total"].item()
-            n_d_updates += 1
-
-        # Step 2 — Update generators + encoders
+        # Step 1 — Update generators + encoders
         for p in model.discriminator_parameters():
             p.requires_grad_(False)
         for p in model.generator_parameters():
@@ -406,6 +424,55 @@ def train_one_epoch(
         ).item()
 
         opt_G.step()
+
+        # Step 2 — Update discriminators (every d_update_every steps)
+        if i % d_update_every == 0:
+            for p in model.discriminator_parameters():
+                p.requires_grad_(True)
+
+            # Query replay buffer — mix current fakes with historical ones
+            if replay_buffer_a is not None and replay_buffer_b is not None:
+                fake_a = replay_buffer_a.push_and_pop(out.x_hat_a).to(device)
+                fake_b = replay_buffer_b.push_and_pop(out.x_hat_b).to(device)
+            else:
+                fake_a = out.x_hat_a.detach()
+                fake_b = out.x_hat_b.detach()
+
+            # Run discriminators on reals + buffered fakes (no full model forward)
+            score_real_a = model.D_A(x_a)
+            score_fake_a = model.D_A(fake_a)
+            score_real_b = model.D_B(x_b)
+            score_fake_b = model.D_B(fake_b)
+
+            real_a_target = torch.full_like(score_real_a, label_smooth_real)
+            fake_a_target = torch.full_like(score_fake_a, label_smooth_fake)
+            real_b_target = torch.full_like(score_real_b, label_smooth_real)
+            fake_b_target = torch.full_like(score_fake_b, label_smooth_fake)
+
+            L_D_A = 0.5 * (F.mse_loss(score_real_a, real_a_target) +
+                           F.mse_loss(score_fake_a, fake_a_target))
+            L_D_B = 0.5 * (F.mse_loss(score_real_b, real_b_target) +
+                           F.mse_loss(score_fake_b, fake_b_target))
+
+            opt_D.zero_grad()
+            (L_D_A + L_D_B).backward()
+
+            if r1_weight > 0 and n_d_updates % r1_every == 0:
+                r1_a = r1_gradient_penalty(model.D_A, x_a)
+                r1_b = r1_gradient_penalty(model.D_B, x_b)
+                r1_loss = (r1_weight / 2.0) * (r1_a + r1_b) * r1_every
+                r1_loss.backward()
+                acc["D_r1"] += (r1_a + r1_b).item()
+                n_r1_updates += 1
+
+            opt_D.step()
+
+            last_d_a = L_D_A.item()
+            last_d_b = L_D_B.item()
+            acc["D_A"]     += last_d_a
+            acc["D_B"]     += last_d_b
+            acc["D_total"] += (L_D_A + L_D_B).item()
+            n_d_updates += 1
 
         # Accumulate
         acc["G_adv"]     += g_losses["adv"].item()
@@ -434,6 +501,8 @@ def train_one_epoch(
     if n_d_updates > 0:
         for k in ["D_A", "D_B", "D_total"]:
             result[k] = acc[k] / n_d_updates
+    if n_r1_updates > 0:
+        result["D_r1"] = acc["D_r1"] / n_r1_updates
     return result
 
 
@@ -474,6 +543,7 @@ def validate(
     for batch in pbar:
         x_a = batch["A"].to(device)
         x_b = batch["B"].to(device)
+        mean_vol_a = batch["mean_vol_A"].to(device)
 
         out = model(x_a, x_b)
 
@@ -484,8 +554,10 @@ def validate(
         loss_acc["content"] += g["content"].item()
         loss_acc["art"]     += g["art"].item()
 
-        # fMRI metrics: compare corrupted input vs corrected output
-        metrics = compute_fmri_metrics(x_a, out.x_hat_b)
+        # fMRI metrics: denormalise to raw BOLD space so metrics are meaningful
+        bold_input     = psc_denormalise(x_a, mean_vol_a)
+        bold_corrected = psc_denormalise(out.x_hat_b, mean_vol_a)
+        metrics = compute_fmri_metrics(bold_input, bold_corrected)
         for k, v in metrics.items():
             metric_acc[k] += v
 
@@ -562,6 +634,10 @@ def parse_args() -> argparse.Namespace:
         help="Label smoothing target for fake samples")
     p.add_argument("--loss_warmup_epochs", type=int,  default=20,
         help="Epochs to linearly ramp cycle/identity weights from 1.0 to full")
+    p.add_argument("--r1_weight", type=float, default=0.0,
+        help="R1 gradient penalty weight (gamma). 0=disabled. Recommended: 10.0")
+    p.add_argument("--r1_every", type=int, default=8,
+        help="Apply R1 penalty every N discriminator updates (lazy regularization)")
 
     # Model configurations 
     p.add_argument("--in_timepoints",    type=int, default=20)
@@ -572,6 +648,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--global_code_dim",  type=int, default=64)
     p.add_argument("--spatial_code_ch",  type=int, default=32)
     p.add_argument("--disc_base_ch",     type=int, default=64)
+    p.add_argument("--no_disc_temporal_diffs", action="store_true",
+        help="Disable temporal difference channels in discriminator input")
+    p.add_argument("--residual", action="store_true",
+        help="Residual learning: decoders predict delta, added to input via skip connection")
 
     # WandB logging
     p.add_argument("--wandb_project", type=str, default="fmri-motion-correction")
@@ -632,7 +712,7 @@ def main() -> None:
         path       = run_dir / "train_losses.csv",
         fieldnames = ["epoch", "lr_G", "lr_D",
                       "G_adv", "G_cyc", "G_idt", "G_content", "G_art", "G_total",
-                      "D_A", "D_B", "D_total",
+                      "D_A", "D_B", "D_total", "D_r1",
                       "grad_norm_G",
                       "score_real_a", "score_fake_a",
                       "score_real_b", "score_fake_b"],
@@ -671,6 +751,8 @@ def main() -> None:
         global_code_dim  = args.global_code_dim,
         spatial_code_ch  = args.spatial_code_ch,
         disc_base_ch     = args.disc_base_ch,
+        disc_temporal_diffs = not args.no_disc_temporal_diffs,
+        residual         = args.residual,
     ).to(device)
 
     # Parameter count summary
@@ -725,6 +807,10 @@ def main() -> None:
             model, opt_G, opt_D, sched_G, sched_D, device
         )
 
+    # Replay buffers for discriminator training stability
+    replay_buf_a = ReplayBuffer(max_size=50)
+    replay_buf_b = ReplayBuffer(max_size=50)
+
     # Training loop
     print(f"\nStarting training: epochs {start_epoch} → {args.epochs}\n")
 
@@ -739,6 +825,10 @@ def main() -> None:
             d_update_every=args.d_update_every,
             label_smooth_real=args.label_smooth_real,
             label_smooth_fake=args.label_smooth_fake,
+            replay_buffer_a=replay_buf_a,
+            replay_buffer_b=replay_buf_b,
+            r1_weight=args.r1_weight,
+            r1_every=args.r1_every,
         )
 
         # Step schedulers
@@ -759,6 +849,7 @@ def main() -> None:
             f"art={train_metrics['G_art']:.4f}  "
             f"D_A={train_metrics['D_A']:.4f}  "
             f"D_B={train_metrics['D_B']:.4f}  "
+            f"r1={train_metrics.get('D_r1', 0):.4f}  "
             f"∇G={train_metrics['grad_norm_G']:.3f}  "
             f"lr_G={lr_G:.2e}"
         )

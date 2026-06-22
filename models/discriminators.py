@@ -67,80 +67,53 @@ class PatchDiscriminator3D(nn.Module):
  
     def __init__(self,
                  in_timepoints: int = 20,
-                 base_ch:       int = 64):
+                 base_ch:       int = 64,
+                 use_temporal_diffs: bool = True):
         super().__init__()
- 
-        # Input channels = original timepoints + temporal differences
-        # T=20 → 20 + 19 = 39 input channels
-        in_ch = in_timepoints + (in_timepoints - 1)   # 2T - 1 = 39
- 
+
+        self.use_temporal_diffs = use_temporal_diffs
+
+        if use_temporal_diffs:
+            in_ch = in_timepoints + (in_timepoints - 1)   # 2T - 1 = 39
+        else:
+            in_ch = in_timepoints                          # T = 20
+
         c = base_ch   # 64
- 
+
         # Four strided conv blocks — each halves spatial dimensions
         self.block1 = DiscConvBlock(in_ch, c,     use_norm=False)  # no norm first
         self.block2 = DiscConvBlock(c,     c * 2, use_norm=True)
         self.block3 = DiscConvBlock(c * 2, c * 4, use_norm=True)
         self.block4 = DiscConvBlock(c * 4, c * 8, use_norm=True)
- 
-        # Output conv — produces patch score map
-        # Spectral norm applied here too for consistency
-        # kernel=3 padding=1: preserves spatial dims at (5, 6, 4)
-        # no normalisation, no activation — raw logits for LSGAN
+
         self.out_conv = nn.utils.spectral_norm(
             nn.Conv3d(c * 8, 1,
                       kernel_size=3, padding=1, bias=True)
         )
- 
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x : (B, T, D, H, W)   fMRI chunk, T timepoints as channels
-                               e.g. (B, 20, 80, 96, 72)
- 
-        Returns
-        -------
-        patch_scores : (B, 1, 5, 6, 4)   patch-level real/fake logits
-                       positive = real, negative = fake (before sigmoid)
-        """
-        # Augment with temporal differences before any conv
-        x = append_temporal_diffs(x)       # (B, 39, 80, 96, 72)
- 
-        x = self.block1(x)                 # (B,  64, 40, 48, 36)
-        x = self.block2(x)                 # (B, 128, 20, 24, 18)
-        x = self.block3(x)                 # (B, 256, 10, 12,  9)
-        x = self.block4(x)                 # (B, 512,  5,  6,  4)
- 
-        return self.out_conv(x)            # (B,   1,  5,  6,  4)
+        if self.use_temporal_diffs:
+            x = append_temporal_diffs(x)       # (B, 2T-1, D, H, W)
+
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+
+        return self.out_conv(x)
  
  
   
 class MotionFreeDiscriminator(PatchDiscriminator3D):
-    """
-    Discriminator for the motion-free domain (D_B).
- 
-    Real  : x_b       true motion-free chunks from the dataset
-    Fake  : x_hat_b   predicted motion-free chunks from MotionFreeDecoder
- 
-    Judges whether a chunk belongs to the real motion-free distribution
-    by evaluating both spatial BOLD structure and temporal dynamics.
-    """
-    pass   # identical architecture — name conveys semantic role
- 
- 
+    """Discriminator for the motion-free domain (D_B)."""
+    def __init__(self, in_timepoints=20, base_ch=64, use_temporal_diffs=True):
+        super().__init__(in_timepoints, base_ch, use_temporal_diffs)
+
+
 class MotionCorruptedDiscriminator(PatchDiscriminator3D):
-    """
-    Discriminator for the motion-corrupted domain (D_A).
- 
-    Real  : x_a       true motion-corrupted chunks from the dataset
-    Fake  : x_hat_a   predicted corrupted chunks from MotionCorruptedDecoder
- 
-    Judges whether a chunk belongs to the real corrupted distribution.
-    The temporal difference channels are especially informative here —
-    motion corruption produces characteristic large temporal differences
-    at spike volumes that clean BOLD signal does not.
-    """
-    pass  
+    """Discriminator for the motion-corrupted domain (D_A)."""
+    def __init__(self, in_timepoints=20, base_ch=64, use_temporal_diffs=True):
+        super().__init__(in_timepoints, base_ch, use_temporal_diffs)
  
  
  

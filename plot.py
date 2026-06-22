@@ -40,7 +40,6 @@ PALETTE = {
 }
 SMOOTH_WINDOW = 10   # rolling mean window for noisy training curves
 
-
 def smooth(values: pd.Series, window: int = SMOOTH_WINDOW) -> pd.Series:
     """Rolling mean with min_periods=1 so edges are not NaN."""
     return values.rolling(window=window, min_periods=1, center=True).mean()
@@ -513,7 +512,6 @@ def main() -> None:
         plot_val_score(df_val, out_dir)
 
     print(f"\nAll plots saved to: {out_dir}")
-
 
 if __name__ == "__main__":
     main()

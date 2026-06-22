@@ -142,6 +142,8 @@ def load_model(checkpoint_path: Path, device: torch.device) -> Tuple[Disentangle
         global_code_dim  = train_args.global_code_dim,
         spatial_code_ch  = train_args.spatial_code_ch,
         disc_base_ch     = train_args.disc_base_ch,
+        disc_temporal_diffs = not getattr(train_args, 'no_disc_temporal_diffs', False),
+        residual         = getattr(train_args, 'residual', False),
     ).to(device)
 
     model.load_state_dict(ckpt["model"])

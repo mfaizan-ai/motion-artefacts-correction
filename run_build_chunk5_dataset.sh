@@ -9,12 +9,12 @@
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 
-set -euo pipefail
-
 mkdir -p logs
 
 source ~/.bashrc
 conda activate moco
+
+set -euo pipefail
 
 echo "=========================================="
 echo "  BUILD CHUNK-5 DATASET"
