@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=10:00:00
+#SBATCH --time=24:00:00
 #SBATCH --partition=gpu
 
 
@@ -25,7 +25,8 @@ python -u train.py \
     --epochs 100 \
     --batch_size 4 \
     --num_workers 8 \
-    --run_name seq_v1 \
+    --run_name tc_only_v1 \
+    --finetune fix_v4/best_model.pt \
     --max_grad_norm 3.0 \
     --w_cyc 10.0 \
     --w_idt 5.0 \
@@ -41,7 +42,4 @@ python -u train.py \
     --use_sequences \
     --manifest_csv ${VIDEO_DIR}/video_sequence_manifest.csv \
     --chunk_metadata_csv ${VIDEO_DIR}/video_chunk_metadata_with_paths.csv \
-    --w_temporal 1.0 \
-    --w_fc 0.5 \
-    --fc_mask_strategy threshold \
-    --fc_threshold 0.2
+    --w_temporal 1.0

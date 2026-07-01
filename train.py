@@ -715,6 +715,10 @@ def parse_args() -> argparse.Namespace:
         help="Run name (default: run_<timestamp>)")
     p.add_argument("--resume", type=str, default=None,
         help="Path to checkpoint to resume from (e.g. checkpoints/run_01/latest.pt)")
+    p.add_argument("--finetune", type=str, default=None,
+        help="Path to checkpoint to load model weights from for fine-tuning. "
+             "Unlike --resume, optimizer/scheduler/epoch are NOT restored — "
+             "training starts fresh from epoch 1 with new LR schedule.")
 
     # Training configs 
     p.add_argument("--epochs",      type=int,   default=300)
@@ -974,7 +978,18 @@ def main() -> None:
     start_epoch = 1
     best_score  = float("-inf")
 
-    if args.resume is not None:
+    if args.finetune is not None:
+        finetune_path = Path(args.finetune)
+        if finetune_path.exists():
+            print(f"\nFine-tuning from {finetune_path} (model weights only) ...")
+            ckpt = torch.load(finetune_path, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model"])
+            print(f"  Loaded model weights from epoch {ckpt['epoch']}  "
+                  f"(optimizer/scheduler reset to epoch-1 state)")
+        else:
+            print(f"  Warning: finetune path {finetune_path} not found — starting fresh")
+
+    elif args.resume is not None:
         resume_path = Path(args.resume)
         if resume_path.exists():
             print(f"\nResuming from {resume_path} ...")

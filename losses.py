@@ -192,8 +192,6 @@ def temporal_consistency_loss(input_seq: Tensor, corrected_seq: Tensor) -> Tenso
 # separates "no real signal" from "real but low-variance" ROIs while
 # staying well clear of float32 catastrophic-cancellation territory.
 _MIN_ROI_STD = 1e-4
-
-
 def _pearson_corr_matrix(X: Tensor) -> Tensor:
     """
     Pearson correlation matrix from a (T, N) timeseries matrix.
@@ -242,7 +240,6 @@ def validate_fc_matrix(fc: Tensor, name: str = "fc", tol: float = 1e-2) -> None:
 
 
 # --- FC connection-strength masking (modular, pluggable strategies) ---
-
 def _off_diagonal_mask(n: int, device: torch.device) -> Tensor:
     """Boolean (N, N) mask selecting each off-diagonal ROI pair once."""
     return torch.triu(torch.ones(n, n, device=device, dtype=torch.bool), diagonal=1)
@@ -293,7 +290,6 @@ FC_MASK_STRATEGIES = {
     "percentile": _mask_by_percentile,
 }
 
-
 def compute_fc_strength_mask(
     fc_reference: Tensor,
     strategy: str = "threshold",
@@ -323,7 +319,6 @@ def compute_fc_strength_mask(
     off_diag = _off_diagonal_mask(n, fc_reference.device)
     strength = fc_reference.abs()
     return FC_MASK_STRATEGIES[strategy](strength, off_diag, **kwargs)
-
 
 # 7. Functional connectivity preservation loss (sequence mode)
 def fc_loss(input_roi_ts: Tensor,
@@ -401,7 +396,6 @@ def fc_loss(input_roi_ts: Tensor,
         return torch.zeros((), device=fc_inp.device, dtype=fc_inp.dtype)
 
     return F.l1_loss(fc_cor[mask], fc_inp[mask].detach())
-
 
 # Combined losses
 def generator_loss(out: ModelOutputs,
