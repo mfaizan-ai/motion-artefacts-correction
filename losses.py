@@ -12,22 +12,27 @@ Losses:
     5. Artefact suppression (MSE → 0)
 """
 
+import logging
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+log = logging.getLogger(__name__)
+
 # Weights for each loss term
 @dataclass
 class LossWeights:
     """Configurable weights for each generator loss term."""
-    adv:     float = 1.0
-    cyc:     float = 10.0
-    idt:     float = 5.0
-    content: float = 1.0
-    art:     float = 0.1
+    adv:      float = 1.0
+    cyc:      float = 10.0
+    idt:      float = 5.0
+    content:  float = 1.0
+    art:      float = 0.1
+    temporal: float = 0.0
+    fc:       float = 0.0
 
 
 # Manages all outputs from the model, including intermediate features and final outputs.
@@ -146,6 +151,256 @@ def artefact_suppression_loss(out: ModelOutputs) -> Tensor:
     return (F.mse_loss(out.a_global_b,  torch.zeros_like(out.a_global_b))  +
             F.mse_loss(out.a_spatial_b, torch.zeros_like(out.a_spatial_b)))
 
+
+# 6. Temporal consistency loss (sequence mode)
+def temporal_consistency_loss(input_seq: Tensor, corrected_seq: Tensor) -> Tensor:
+    """
+    Preserve frame-to-frame BOLD dynamics through motion correction.
+
+    Concatenates the S chunks into one continuous T_total = S*T volume
+    sequence (temporal order preserved throughout, including the chunk
+    boundaries) and compares first-order temporal differences:
+        dY_t = Y_{t+1} - Y_t   (corrected)
+        dX_t = X_{t+1} - X_t   (input)
+        L_temp = mean(| dY - dX |)
+
+    This encourages the generator to preserve real signal change (the
+    underlying neural dynamics) while still being free to remove motion
+    artefacts — it does not push the corrected signal to be flat, only to
+    change in step with the original.
+
+    Args:
+        input_seq:     (S, T, X, Y, Z)  original chunks, temporal order
+        corrected_seq: (S, T, X, Y, Z)  corrected chunks, same order
+
+    Returns:
+        Scalar L1 loss over all S*T-1 consecutive volume pairs.
+    """
+    S, T = input_seq.shape[:2]
+    x = input_seq.reshape(S * T, *input_seq.shape[2:]).detach()
+    y = corrected_seq.reshape(S * T, *corrected_seq.shape[2:])
+
+    dx = x[1:] - x[:-1]
+    dy = y[1:] - y[:-1]
+    return F.l1_loss(dy, dx)
+
+
+# ROIs with std below this (in PSC units) are treated as degenerate —
+# e.g. an ROI that falls entirely in PSC-zeroed background after nearest-
+# neighbour atlas downsampling has an exactly-constant timeseries. Real
+# BOLD PSC signal varies on the order of 1e-2 to 1; 1e-4 comfortably
+# separates "no real signal" from "real but low-variance" ROIs while
+# staying well clear of float32 catastrophic-cancellation territory.
+_MIN_ROI_STD = 1e-4
+
+
+def _pearson_corr_matrix(X: Tensor) -> Tensor:
+    """
+    Pearson correlation matrix from a (T, N) timeseries matrix.
+    Fully differentiable.
+
+    ROI columns with near-zero variance (degenerate — e.g. constant or
+    all-zero timeseries) have mathematically undefined correlation. By
+    convention they are treated as uncorrelated with every other ROI
+    (zeroed off-diagonal) but self-correlated (diagonal forced to 1.0),
+    so the result is always a well-formed correlation matrix — valid
+    input to validate_fc_matrix — regardless of degenerate ROIs.
+    """
+    X_centered = X - X.mean(dim=0, keepdim=True)
+    std = X_centered.std(dim=0, keepdim=True)              # (1, N)
+    degenerate = (std.squeeze(0) < _MIN_ROI_STD)            # (N,) bool
+
+    X_norm = X_centered / std.clamp(min=_MIN_ROI_STD)
+    X_norm = X_norm.masked_fill(degenerate.unsqueeze(0), 0.0)
+
+    corr = (X_norm.T @ X_norm) / max(X.shape[0] - 1, 1)
+
+    if degenerate.any():
+        # corr's diagonal is already exactly 0 at degenerate positions
+        # (zeroed column dotted with itself); add 1.0 there out-of-place
+        # so autograd never sees an in-place write to a graph tensor.
+        diag_fix = torch.diag(degenerate.to(corr.dtype))
+        corr = corr + diag_fix
+
+    return corr
+
+
+def validate_fc_matrix(fc: Tensor, name: str = "fc", tol: float = 1e-2) -> None:
+    """
+    Sanity-check a Pearson FC matrix: square (N, N), symmetric, unit diagonal.
+    Raises AssertionError on failure. Intended to run on a detached tensor.
+    """
+    assert fc.dim() == 2 and fc.shape[0] == fc.shape[1], (
+        f"{name}: expected square (N, N) matrix, got {tuple(fc.shape)}"
+    )
+    asym = (fc - fc.T).abs().max().item()
+    assert asym < tol, f"{name}: not symmetric (max |fc - fc.T| = {asym:.2e})"
+
+    diag = torch.diagonal(fc)
+    diag_err = (diag - 1.0).abs().max().item()
+    assert diag_err < tol, f"{name}: diagonal not ~1 (max |diag - 1| = {diag_err:.2e})"
+
+
+# --- FC connection-strength masking (modular, pluggable strategies) ---
+
+def _off_diagonal_mask(n: int, device: torch.device) -> Tensor:
+    """Boolean (N, N) mask selecting each off-diagonal ROI pair once."""
+    return torch.triu(torch.ones(n, n, device=device, dtype=torch.bool), diagonal=1)
+
+
+def _mask_by_threshold(strength: Tensor, off_diag: Tensor, *,
+                        threshold: float = 0.3, **_) -> Tensor:
+    """Keep off-diagonal pairs with |r| >= threshold."""
+    return (strength >= threshold) & off_diag
+
+
+def _mask_by_topk(strength: Tensor, off_diag: Tensor, *,
+                   top_k: Optional[int] = None, **_) -> Tensor:
+    """Keep the top_k strongest |r| off-diagonal pairs."""
+    if top_k is None:
+        raise ValueError(
+            "fc_mask_strategy='topk' requires top_k to be set (got None) — "
+            "pass --fc_top_k on the CLI"
+        )
+    vals = strength[off_diag]
+    k = min(top_k, vals.numel())
+    if k == 0:
+        return torch.zeros_like(off_diag)
+    cutoff = torch.topk(vals, k).values.min()
+    return (strength >= cutoff) & off_diag
+
+
+def _mask_by_percentile(strength: Tensor, off_diag: Tensor, *,
+                         percentile: Optional[float] = None, **_) -> Tensor:
+    """
+    Keep off-diagonal pairs with |r| at or above the given percentile.
+    e.g. percentile=90 keeps the strongest 10% of connections.
+    """
+    if percentile is None:
+        raise ValueError(
+            "fc_mask_strategy='percentile' requires percentile to be set "
+            "(got None) — pass --fc_percentile on the CLI"
+        )
+    vals = strength[off_diag]
+    cutoff = torch.quantile(vals, percentile / 100.0)
+    return (strength >= cutoff) & off_diag
+
+
+# Registry: add new masking strategies here without touching call sites.
+FC_MASK_STRATEGIES = {
+    "threshold":  _mask_by_threshold,
+    "topk":       _mask_by_topk,
+    "percentile": _mask_by_percentile,
+}
+
+
+def compute_fc_strength_mask(
+    fc_reference: Tensor,
+    strategy: str = "threshold",
+    **kwargs,
+) -> Tensor:
+    """
+    Build a boolean (N, N) off-diagonal mask selecting the "meaningful"
+    ROI-to-ROI connections of a reference FC matrix, by connection
+    strength (|r|). Diagonal is always excluded.
+
+    Args:
+        fc_reference: (N, N) Pearson FC matrix used to judge strength
+        strategy:     key into FC_MASK_STRATEGIES
+                      ("threshold", "topk", "percentile")
+        **kwargs:     forwarded to the selected strategy function
+                      (e.g. threshold=0.3, top_k=500, percentile=90.0)
+
+    Returns:
+        (N, N) boolean mask, True for retained pairs (upper triangle only).
+    """
+    if strategy not in FC_MASK_STRATEGIES:
+        raise ValueError(
+            f"Unknown FC masking strategy '{strategy}'. "
+            f"Choose from: {list(FC_MASK_STRATEGIES)}"
+        )
+    n = fc_reference.shape[0]
+    off_diag = _off_diagonal_mask(n, fc_reference.device)
+    strength = fc_reference.abs()
+    return FC_MASK_STRATEGIES[strategy](strength, off_diag, **kwargs)
+
+
+# 7. Functional connectivity preservation loss (sequence mode)
+def fc_loss(input_roi_ts: Tensor,
+            corrected_roi_ts: Tensor,
+            mask_strategy: str = "threshold",
+            fc_threshold: float = 0.3,
+            top_k: Optional[int] = None,
+            percentile: Optional[float] = None,
+            validate: bool = True,
+            stats: Optional[dict] = None) -> Tensor:
+    """
+    Regularise the generator to preserve the subject's strong (likely
+    genuine) ROI-to-ROI functional connections, while leaving weak /
+    borderline correlations — more likely motion-driven noise — out of
+    the loss so the model is free to alter them during correction.
+
+    The retention mask is built from the *motion-corrupted input* FC
+    matrix's connection strength (not the corrected output), since the
+    input represents the subject's actual (if noisy) underlying network.
+
+        L_FC = (1/|M|) * sum_{(i,j) in M} |FC_input(i,j) - FC_pred(i,j)|
+
+    where M is the set of retained ROI pairs (diagonal always excluded).
+
+    Args:
+        input_roi_ts:     (T_total, n_rois)  ROI mean timeseries, input
+        corrected_roi_ts: (T_total, n_rois)  ROI mean timeseries, corrected
+        mask_strategy:     "threshold" | "topk" | "percentile"
+                            (see compute_fc_strength_mask / FC_MASK_STRATEGIES)
+        fc_threshold:       |r| cutoff, used when mask_strategy="threshold"
+        top_k:              pair count, used when mask_strategy="topk"
+        percentile:         cutoff (0-100), used when mask_strategy="percentile"
+        validate:           run FC-matrix sanity checks (shape/symmetry/diag)
+        stats:              optional dict, populated in-place with
+                             {"n_retained", "n_total_pairs", "retained_fraction"}
+
+    Returns:
+        Scalar L1 loss over the retained ROI pairs only. Returns 0 if the
+        mask retains nothing (logged as a warning).
+    """
+    assert input_roi_ts.shape == corrected_roi_ts.shape, (
+        f"fc_loss: shape mismatch input={tuple(input_roi_ts.shape)} "
+        f"corrected={tuple(corrected_roi_ts.shape)}"
+    )
+
+    fc_inp = _pearson_corr_matrix(input_roi_ts)
+    fc_cor = _pearson_corr_matrix(corrected_roi_ts)
+
+    if validate:
+        validate_fc_matrix(fc_inp.detach(), name="fc_input")
+        validate_fc_matrix(fc_cor.detach(), name="fc_corrected")
+
+    mask = compute_fc_strength_mask(
+        fc_inp.detach(), strategy=mask_strategy,
+        threshold=fc_threshold, top_k=top_k, percentile=percentile,
+    )
+
+    n = fc_inp.shape[0]
+    n_total_pairs = n * (n - 1) // 2
+    n_retained = int(mask.sum().item())
+    retained_fraction = n_retained / max(n_total_pairs, 1)
+
+    if stats is not None:
+        stats["n_retained"] = n_retained
+        stats["n_total_pairs"] = n_total_pairs
+        stats["retained_fraction"] = retained_fraction
+
+    log.info(
+        f"fc_loss: retained {n_retained}/{n_total_pairs} ROI pairs "
+        f"({retained_fraction:.1%})  strategy={mask_strategy}"
+    )
+
+    if n_retained == 0:
+        log.warning("fc_loss: mask retained 0 ROI pairs — returning zero loss")
+        return torch.zeros((), device=fc_inp.device, dtype=fc_inp.dtype)
+
+    return F.l1_loss(fc_cor[mask], fc_inp[mask].detach())
 
 
 # Combined losses

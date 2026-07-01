@@ -12,6 +12,7 @@ fix_v4/
 qc_results/
 runs/
 dataset_quality_check/chunk5/
+ROI_analysis/
 
 baseline/
 .vscode
@@ -20,4 +21,24 @@ baseline/
 *.pt
 *.pth
 *.log
+
+# Training run outputs
+seq_smoke_test/
+seq_v1/
+seq_v1_buggy_norm_archive/
+
+# Dataset CSVs (generated, not source)
+dataset/*.csv
+
+# Dataset creation scripts (HPC-specific, not portable)
+dataset_creation_scripts/
+
+# Experimental / diagnostic scripts
+atlas_fc.py
+run_train_smoke_test.sh
+run_visualise.sh
+visualise_results.py
+useful_scripts/check_identity_collapse.py
+useful_scripts/roi_atlas_analysis.py
+useful_scripts/run_check_identity_collapse.sh
 

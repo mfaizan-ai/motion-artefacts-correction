@@ -23,10 +23,13 @@ from tqdm import tqdm
 
 
 
-from dataset import build_dataloaders, psc_denormalise          # dataset.py
+from dataset import build_dataloaders, psc_denormalise, TARGET_SPATIAL  # dataset.py
 from losses  import (generator_loss, discriminator_loss,        # losses.py
-                     LossWeights, ModelOutputs)
-from models.model import DisentangledCycleGAN                 
+                     LossWeights, ModelOutputs,
+                     temporal_consistency_loss, fc_loss)
+from atlas_fc import (SchaeferAtlas, load_age_atlases,           # atlas_fc.py
+                      age_group_for_subject, DEFAULT_ATLAS_PATHS)
+from models.model import DisentangledCycleGAN
 
 
 # fMRI quality metrics
@@ -285,11 +288,11 @@ def load_checkpoint(
     sched_G.load_state_dict(ckpt["sched_G"])
     sched_D.load_state_dict(ckpt["sched_D"])
 
-    torch.set_rng_state(ckpt["rng_torch"])
+    torch.set_rng_state(ckpt["rng_torch"].cpu().byte())
     np.random.set_state(ckpt["rng_numpy"])
     random.setstate(ckpt["rng_python"])
     if ckpt["rng_cuda"] is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state(ckpt["rng_cuda"])
+        torch.cuda.set_rng_state(ckpt["rng_cuda"].cpu().byte())
 
     print(f"  Resumed from epoch {ckpt['epoch']}  best_score={ckpt['best_score']:.4f}")
     return ckpt["epoch"] + 1, ckpt["best_score"]
@@ -324,11 +327,13 @@ def get_epoch_weights(
         return base_weights
     t = epoch / warmup_epochs
     return LossWeights(
-        adv     = base_weights.adv,
-        cyc     = 1.0 + (base_weights.cyc - 1.0) * t,
-        idt     = 1.0 + (base_weights.idt - 1.0) * t,
-        content = base_weights.content,
-        art     = base_weights.art,
+        adv      = base_weights.adv,
+        cyc      = 1.0 + (base_weights.cyc - 1.0) * t,
+        idt      = 1.0 + (base_weights.idt - 1.0) * t,
+        content  = base_weights.content,
+        art      = base_weights.art,
+        temporal = base_weights.temporal,
+        fc       = base_weights.fc,
     )
 
 class ReplayBuffer:
@@ -375,6 +380,13 @@ def train_one_epoch(
     replay_buffer_b:   Optional['ReplayBuffer'] = None,
     r1_weight:         float = 0.0,
     r1_every:          int   = 8,
+    use_sequences:     bool  = False,
+    atlases:           Optional[Dict[str, SchaeferAtlas]] = None,
+    max_batches:       Optional[int] = None,
+    fc_mask_strategy:  str   = "threshold",
+    fc_threshold:      float = 0.3,
+    fc_top_k:          Optional[int] = None,
+    fc_percentile:     Optional[float] = None,
 ) -> Dict[str, float]:
     """
     Run one full training epoch.
@@ -386,12 +398,14 @@ def train_one_epoch(
     # Accumulators
     acc = {k: 0.0 for k in
            ["G_adv", "G_cyc", "G_idt", "G_content", "G_art", "G_total",
+            "G_temporal", "G_fc", "G_fc_n_retained", "G_fc_retained_frac",
             "D_A", "D_B", "D_total", "D_r1", "grad_norm_G",
             "score_real_a", "score_fake_a",
             "score_real_b", "score_fake_b"]}
     n_batches = 0
     n_d_updates = 0
     n_r1_updates = 0
+    n_fc_updates = 0
 
     # Advance A queue at the start of each epoch
     loader.dataset.on_epoch_start()
@@ -405,8 +419,16 @@ def train_one_epoch(
     last_d_b = 0.0
 
     for i, batch in enumerate(pbar):
-        x_a = batch["A"].to(device)   # (B, T, X, Y, Z)  corrupted
-        x_b = batch["B"].to(device)   # (B, T, X, Y, Z)  motion-free
+        if max_batches is not None and i >= max_batches:
+            break
+        if use_sequences:
+            x_a = batch["A"].squeeze(0).to(device)   # (S, T, X, Y, Z)
+            x_b = batch["B"].squeeze(0).to(device)   # (S, T, X, Y, Z)
+            atlas = atlases[age_group_for_subject(batch["subject_id"][0])] \
+                if atlases is not None else None
+        else:
+            x_a = batch["A"].to(device)   # (B, T, X, Y, Z)  corrupted
+            x_b = batch["B"].to(device)   # (B, T, X, Y, Z)  motion-free
 
         # Step 1 — Update generators + encoders
         for p in model.discriminator_parameters():
@@ -416,8 +438,36 @@ def train_one_epoch(
 
         out = model(x_a, x_b, detach_fakes_for_D=False)
         g_losses = generator_loss(out, x_a, x_b, weights)
+
+        # Sequence losses: temporal consistency + FC preservation
+        total_loss = g_losses["total"]
+        if use_sequences:
+            if weights.temporal > 0:
+                L_temp = temporal_consistency_loss(x_a, out.x_hat_b)
+                total_loss = total_loss + weights.temporal * L_temp
+                g_losses["temporal"] = L_temp
+            if weights.fc > 0 and atlas is not None:
+                S, T = x_a.shape[:2]
+                x_a_concat = x_a.reshape(S * T, *x_a.shape[2:])
+                y_concat   = out.x_hat_b.reshape(S * T, *out.x_hat_b.shape[2:])
+                input_roi_ts     = atlas.extract_roi_timeseries(x_a_concat)
+                corrected_roi_ts = atlas.extract_roi_timeseries(y_concat)
+                fc_stats = {}
+                L_fc = fc_loss(
+                    input_roi_ts, corrected_roi_ts,
+                    mask_strategy=fc_mask_strategy,
+                    fc_threshold=fc_threshold,
+                    top_k=fc_top_k,
+                    percentile=fc_percentile,
+                    validate=True,
+                    stats=fc_stats,
+                )
+                total_loss = total_loss + weights.fc * L_fc
+                g_losses["fc"] = L_fc
+                g_losses["fc_stats"] = fc_stats
+
         opt_G.zero_grad()
-        g_losses["total"].backward()
+        total_loss.backward()
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.generator_parameters(), max_norm=max_grad_norm
@@ -480,22 +530,35 @@ def train_one_epoch(
         acc["G_idt"]     += g_losses["idt"].item()
         acc["G_content"] += g_losses["content"].item()
         acc["G_art"]     += g_losses["art"].item()
-        acc["G_total"]   += g_losses["total"].item()
+        acc["G_total"]   += total_loss.item()
         acc["grad_norm_G"] += grad_norm
+        if "temporal" in g_losses:
+            acc["G_temporal"] += g_losses["temporal"].item()
+        if "fc" in g_losses:
+            acc["G_fc"] += g_losses["fc"].item()
+            acc["G_fc_n_retained"]    += g_losses["fc_stats"]["n_retained"]
+            acc["G_fc_retained_frac"] += g_losses["fc_stats"]["retained_fraction"]
+            n_fc_updates += 1
         acc["score_real_a"] += out.score_real_a.mean().item()
         acc["score_fake_a"] += out.score_fake_a.mean().item()
         acc["score_real_b"] += out.score_real_b.mean().item()
         acc["score_fake_b"] += out.score_fake_b.mean().item()
         n_batches += 1
 
-        pbar.set_postfix({
-            "G":    f"{g_losses['total'].item():.3f}",
+        postfix = {
+            "G":    f"{total_loss.item():.3f}",
             "cyc":  f"{g_losses['cyc'].item():.3f}",
             "idt":  f"{g_losses['idt'].item():.3f}",
             "D_A":  f"{last_d_a:.3f}",
             "D_B":  f"{last_d_b:.3f}",
             "∇G":   f"{grad_norm:.2f}",
-        })
+        }
+        if "temporal" in g_losses:
+            postfix["tc"] = f"{g_losses['temporal'].item():.4f}"
+        if "fc" in g_losses:
+            postfix["fc"] = f"{g_losses['fc'].item():.4f}"
+            postfix["fc_n"] = str(g_losses["fc_stats"]["n_retained"])
+        pbar.set_postfix(postfix)
 
     result = {k: v / max(n_batches, 1) for k, v in acc.items()}
     if n_d_updates > 0:
@@ -503,6 +566,9 @@ def train_one_epoch(
             result[k] = acc[k] / n_d_updates
     if n_r1_updates > 0:
         result["D_r1"] = acc["D_r1"] / n_r1_updates
+    if n_fc_updates > 0:
+        result["G_fc_n_retained"]    = acc["G_fc_n_retained"] / n_fc_updates
+        result["G_fc_retained_frac"] = acc["G_fc_retained_frac"] / n_fc_updates
     return result
 
 
@@ -514,6 +580,13 @@ def validate(
     weights: LossWeights,
     device:  torch.device,
     epoch:   int,
+    use_sequences: bool = False,
+    atlases: Optional[Dict[str, SchaeferAtlas]] = None,
+    max_batches: Optional[int] = None,
+    fc_mask_strategy: str = "threshold",
+    fc_threshold: float = 0.3,
+    fc_top_k: Optional[int] = None,
+    fc_percentile: Optional[float] = None,
 ) -> Dict[str, float]:
     """
     Run full validation pass.
@@ -521,12 +594,15 @@ def validate(
     Computes:
         - Generator losses (cyc, idt, content, art) — no adversarial
         - fMRI quality metrics on x_a vs x_hat_b (corrected output)
+        - Temporal consistency and FC metrics (sequence mode only)
 
     Returns dict of mean metrics over the full val set.
     """
     model.eval()
 
-    loss_acc = {k: 0.0 for k in ["cyc", "idt", "content", "art"]}
+    loss_acc = {k: 0.0 for k in ["cyc", "idt", "content", "art",
+                                  "temporal", "fc",
+                                  "fc_n_retained", "fc_retained_frac"]}
     metric_acc = {k: 0.0 for k in [
         "dvars_input", "dvars_corrected", "dvars_improvement",
         "tsnr_input",  "tsnr_corrected",  "tsnr_improvement",
@@ -534,16 +610,26 @@ def validate(
         "smoothness_input", "smoothness_corrected", "smoothness_ratio",
     ]}
     n_batches = 0
+    n_fc_updates = 0
 
     pbar = tqdm(loader,
                 desc=f"Epoch {epoch:03d} [val]  ",
                 leave=False,
                 dynamic_ncols=True)
 
-    for batch in pbar:
-        x_a = batch["A"].to(device)
-        x_b = batch["B"].to(device)
-        mean_vol_a = batch["mean_vol_A"].to(device)
+    for i, batch in enumerate(pbar):
+        if max_batches is not None and i >= max_batches:
+            break
+        if use_sequences:
+            x_a = batch["A"].squeeze(0).to(device)
+            x_b = batch["B"].squeeze(0).to(device)
+            mean_vol_a = batch["mean_vol_A"].squeeze(0).to(device)
+            atlas = atlases[age_group_for_subject(batch["subject_id"][0])] \
+                if atlases is not None else None
+        else:
+            x_a = batch["A"].to(device)
+            x_b = batch["B"].to(device)
+            mean_vol_a = batch["mean_vol_A"].to(device)
 
         out = model(x_a, x_b)
 
@@ -554,6 +640,32 @@ def validate(
         loss_acc["content"] += g["content"].item()
         loss_acc["art"]     += g["art"].item()
 
+        # Sequence-specific losses
+        if use_sequences:
+            if weights.temporal > 0:
+                loss_acc["temporal"] += temporal_consistency_loss(
+                    x_a, out.x_hat_b
+                ).item()
+            if weights.fc > 0 and atlas is not None:
+                S, T = x_a.shape[:2]
+                x_a_concat = x_a.reshape(S * T, *x_a.shape[2:])
+                y_concat   = out.x_hat_b.reshape(S * T, *out.x_hat_b.shape[2:])
+                input_roi_ts     = atlas.extract_roi_timeseries(x_a_concat)
+                corrected_roi_ts = atlas.extract_roi_timeseries(y_concat)
+                fc_stats = {}
+                loss_acc["fc"] += fc_loss(
+                    input_roi_ts, corrected_roi_ts,
+                    mask_strategy=fc_mask_strategy,
+                    fc_threshold=fc_threshold,
+                    top_k=fc_top_k,
+                    percentile=fc_percentile,
+                    validate=True,
+                    stats=fc_stats,
+                ).item()
+                loss_acc["fc_n_retained"]    += fc_stats["n_retained"]
+                loss_acc["fc_retained_frac"] += fc_stats["retained_fraction"]
+                n_fc_updates += 1
+
         # fMRI metrics: denormalise to raw BOLD space so metrics are meaningful
         bold_input     = psc_denormalise(x_a, mean_vol_a)
         bold_corrected = psc_denormalise(out.x_hat_b, mean_vol_a)
@@ -563,18 +675,24 @@ def validate(
 
         n_batches += 1
 
-        pbar.set_postfix({
+        postfix = {
             "cyc":       f"{g['cyc'].item():.3f}",
             "idt":       f"{g['idt'].item():.3f}",
             "tSNR↑":     f"{metrics['tsnr_improvement']:+.3f}",
             "DVARS↓":    f"{metrics['dvars_improvement']:+.3f}",
-        })
+        }
+        if use_sequences and weights.temporal > 0:
+            postfix["tc"] = f"{loss_acc['temporal']/n_batches:.4f}"
+        pbar.set_postfix(postfix)
 
     results = {}
     for k, v in loss_acc.items():
-        results[f"val_{k}"] = v / n_batches
+        if k in ("fc_n_retained", "fc_retained_frac"):
+            results[f"val_{k}"] = v / max(n_fc_updates, 1)
+        else:
+            results[f"val_{k}"] = v / max(n_batches, 1)
     for k, v in metric_acc.items():
-        results[f"val_{k}"] = v / n_batches
+        results[f"val_{k}"] = v / max(n_batches, 1)
 
     return results
 
@@ -653,6 +771,43 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--residual", action="store_true",
         help="Residual learning: decoders predict delta, added to input via skip connection")
 
+    # Sequence training (temporal consistency + FC losses)
+    p.add_argument("--use_sequences", action="store_true",
+        help="Sequence-aware training with temporal and FC losses")
+    p.add_argument("--manifest_csv", type=str, default=None,
+        help="Path to video_sequence_manifest.csv")
+    p.add_argument("--chunk_metadata_csv", type=str, default=None,
+        help="Path to video_chunk_metadata_with_paths.csv")
+    p.add_argument("--w_temporal", type=float, default=1.0,
+        help="Temporal consistency loss weight (sequence mode)")
+    p.add_argument("--w_fc", type=float, default=0.5,
+        help="FC preservation loss weight (sequence mode)")
+    p.add_argument("--fc_mask_strategy", type=str, default="threshold",
+        choices=["threshold", "topk", "percentile"],
+        help="Strategy for selecting which ROI-pair FC connections to "
+             "regularise — only retained pairs contribute to the FC loss")
+    p.add_argument("--fc_threshold", type=float, default=0.3,
+        help="|r| cutoff for fc_mask_strategy=threshold: only input ROI "
+             "pairs with correlation strength above this are preserved")
+    p.add_argument("--fc_top_k", type=int, default=None,
+        help="Number of strongest ROI pairs to keep for fc_mask_strategy=topk")
+    p.add_argument("--fc_percentile", type=float, default=None,
+        help="Percentile (0-100) cutoff for fc_mask_strategy=percentile")
+    p.add_argument("--atlas_2mo_path", type=str,
+        default=DEFAULT_ATLAS_PATHS["2mo"],
+        help="Schaefer-400 atlas (nihpd-02-05) for 2mo subjects, "
+             "already aligned to the BOLD common-space grid")
+    p.add_argument("--atlas_9mo_path", type=str,
+        default=DEFAULT_ATLAS_PATHS["9mo"],
+        help="Schaefer-400 atlas (nihpd-08-11) for 9mo subjects "
+             "(subject_id ends with 'A')")
+
+    # Smoke testing
+    p.add_argument("--max_train_batches", type=int, default=None,
+        help="Cap train batches per epoch (smoke testing)")
+    p.add_argument("--max_val_batches", type=int, default=None,
+        help="Cap val batches per epoch (smoke testing)")
+
     # WandB logging
     p.add_argument("--wandb_project", type=str, default="fmri-motion-correction")
     p.add_argument("--wandb_entity",  type=str, default=None,
@@ -660,7 +815,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_wandb", action="store_true",
         help="Disable WandB logging entirely")
 
-    return p.parse_args()
+    args = p.parse_args()
+
+    if args.fc_mask_strategy == "topk" and args.fc_top_k is None:
+        p.error("--fc_mask_strategy=topk requires --fc_top_k to be set")
+    if args.fc_mask_strategy == "percentile" and args.fc_percentile is None:
+        p.error("--fc_mask_strategy=percentile requires --fc_percentile to be set")
+
+    return args
 
 
 # Reproducibility
@@ -708,36 +870,48 @@ def main() -> None:
         print(f"WandB         : offline  (sync with: wandb sync {run_dir}/wandb/)")
 
     # CSV loggers
-    train_csv = CSVLogger(
-        path       = run_dir / "train_losses.csv",
-        fieldnames = ["epoch", "lr_G", "lr_D",
-                      "G_adv", "G_cyc", "G_idt", "G_content", "G_art", "G_total",
-                      "D_A", "D_B", "D_total", "D_r1",
-                      "grad_norm_G",
-                      "score_real_a", "score_fake_a",
-                      "score_real_b", "score_fake_b"],
-    )
+    train_fields = ["epoch", "lr_G", "lr_D",
+                     "G_adv", "G_cyc", "G_idt", "G_content", "G_art", "G_total",
+                     "D_A", "D_B", "D_total", "D_r1",
+                     "grad_norm_G",
+                     "score_real_a", "score_fake_a",
+                     "score_real_b", "score_fake_b"]
+    val_fields   = ["epoch",
+                    "val_cyc", "val_idt", "val_content", "val_art",
+                    "val_dvars_input",     "val_dvars_corrected",     "val_dvars_improvement",
+                    "val_tsnr_input",      "val_tsnr_corrected",      "val_tsnr_improvement",
+                    "val_gs_std_input",    "val_gs_std_corrected",    "val_gs_std_improvement",
+                    "val_smoothness_input","val_smoothness_corrected","val_smoothness_ratio",
+                    "val_score"]
+    if args.use_sequences:
+        train_fields += ["G_temporal", "G_fc", "G_fc_n_retained", "G_fc_retained_frac"]
+        val_fields   += ["val_temporal", "val_fc", "val_fc_n_retained", "val_fc_retained_frac"]
 
-    val_csv = CSVLogger(
-        path       = run_dir / "val_metrics.csv",
-        fieldnames = ["epoch",
-                      "val_cyc", "val_idt", "val_content", "val_art",
-                      "val_dvars_input",     "val_dvars_corrected",     "val_dvars_improvement",
-                      "val_tsnr_input",      "val_tsnr_corrected",      "val_tsnr_improvement",
-                      "val_gs_std_input",    "val_gs_std_corrected",    "val_gs_std_improvement",
-                      "val_smoothness_input","val_smoothness_corrected","val_smoothness_ratio",
-                      "val_score"],
-    )
+    train_csv = CSVLogger(path=run_dir / "train_losses.csv", fieldnames=train_fields)
+    val_csv   = CSVLogger(path=run_dir / "val_metrics.csv",  fieldnames=val_fields)
 
     # Dataloaders
     print("\nBuilding dataloaders ...")
+    if args.use_sequences:
+        if args.manifest_csv is None or args.chunk_metadata_csv is None:
+            raise ValueError(
+                "--manifest_csv and --chunk_metadata_csv required "
+                "with --use_sequences"
+            )
+        print(f"  Sequence mode enabled")
+        print(f"  Manifest       : {args.manifest_csv}")
+        print(f"  Chunk metadata : {args.chunk_metadata_csv}")
     loaders = build_dataloaders(
-        dataset_root  = args.data_root,
-        splits        = ["train", "val"],
-        batch_size    = args.batch_size,
-        num_workers   = args.num_workers,
-        pin_memory    = True,
-        augment_train = True)
+        dataset_root       = args.data_root,
+        splits             = ["train", "val"],
+        batch_size         = args.batch_size,
+        num_workers        = args.num_workers,
+        pin_memory         = True,
+        augment_train      = True,
+        sequence_mode      = args.use_sequences,
+        manifest_csv       = args.manifest_csv,
+        chunk_metadata_csv = args.chunk_metadata_csv,
+    )
     
     # Model
     print("Building model ...")
@@ -766,12 +940,23 @@ def main() -> None:
 
     # Loss weights
     weights = LossWeights(
-        adv     = args.w_adv,
-        cyc     = args.w_cyc,
-        idt     = args.w_idt,
-        content = args.w_content,
-        art     = args.w_art,
+        adv      = args.w_adv,
+        cyc      = args.w_cyc,
+        idt      = args.w_idt,
+        content  = args.w_content,
+        art      = args.w_art,
+        temporal = args.w_temporal if args.use_sequences else 0.0,
+        fc       = args.w_fc       if args.use_sequences else 0.0,
     )
+
+    # Schaefer-400 atlases for FC loss (age-appropriate: 2mo vs 9mo)
+    atlases = None
+    if args.use_sequences and weights.fc > 0:
+        print("\nLoading Schaefer-400 atlases ...")
+        atlases = load_age_atlases(
+            target_spatial=TARGET_SPATIAL,
+            atlas_paths={"2mo": args.atlas_2mo_path, "9mo": args.atlas_9mo_path},
+        )
 
     # Optimisers
     betas = (args.beta1, args.beta2)
@@ -829,6 +1014,13 @@ def main() -> None:
             replay_buffer_b=replay_buf_b,
             r1_weight=args.r1_weight,
             r1_every=args.r1_every,
+            use_sequences=args.use_sequences,
+            atlases=atlases,
+            max_batches=args.max_train_batches,
+            fc_mask_strategy=args.fc_mask_strategy,
+            fc_threshold=args.fc_threshold,
+            fc_top_k=args.fc_top_k,
+            fc_percentile=args.fc_percentile,
         )
 
         # Step schedulers
@@ -839,8 +1031,8 @@ def main() -> None:
         lr_D = sched_D.get_last_lr()[0]
         epoch_time = time.time() - epoch_start
 
-        # Console summary 
-        print(
+        # Console summary
+        summary = (
             f"Epoch {epoch:03d}/{args.epochs}  "
             f"({epoch_time:.0f}s)  "
             f"G={train_metrics['G_total']:.4f}  "
@@ -853,6 +1045,14 @@ def main() -> None:
             f"∇G={train_metrics['grad_norm_G']:.3f}  "
             f"lr_G={lr_G:.2e}"
         )
+        if args.use_sequences:
+            summary += (
+                f"  tc={train_metrics['G_temporal']:.4f}  "
+                f"fc={train_metrics['G_fc']:.4f}  "
+                f"fc_pairs={train_metrics.get('G_fc_n_retained', 0):.0f}"
+                f"({train_metrics.get('G_fc_retained_frac', 0):.1%})"
+            )
+        print(summary)
 
         # CSV 
         train_csv.write({
@@ -873,7 +1073,14 @@ def main() -> None:
         #  Validation 
         if epoch % args.val_every == 0:
             val_metrics = validate(
-                model, loaders["val"], epoch_weights, device, epoch
+                model, loaders["val"], epoch_weights, device, epoch,
+                use_sequences=args.use_sequences,
+                atlases=atlases,
+                max_batches=args.max_val_batches,
+                fc_mask_strategy=args.fc_mask_strategy,
+                fc_threshold=args.fc_threshold,
+                fc_top_k=args.fc_top_k,
+                fc_percentile=args.fc_percentile,
             )
             val_score = compute_val_score({
                 k.replace("val_", ""): v
@@ -883,7 +1090,7 @@ def main() -> None:
             val_metrics["val_score"] = val_score
 
             # Console
-            print(
+            val_summary = (
                 f"  [VAL]  "
                 f"cyc={val_metrics['val_cyc']:.4f}  "
                 f"idt={val_metrics['val_idt']:.4f}  "
@@ -891,7 +1098,16 @@ def main() -> None:
                 f"DVARS↓={val_metrics['val_dvars_improvement']:+.4f}  "
                 f"GS_std↓={val_metrics['val_gs_std_improvement']:+.4f}  "
                 f"smooth={val_metrics['val_smoothness_ratio']:.3f}  "
-                f"score={val_score:.4f}")
+                f"score={val_score:.4f}"
+            )
+            if args.use_sequences:
+                val_summary += (
+                    f"  tc={val_metrics['val_temporal']:.4f}  "
+                    f"fc={val_metrics['val_fc']:.4f}  "
+                    f"fc_pairs={val_metrics.get('val_fc_n_retained', 0):.0f}"
+                    f"({val_metrics.get('val_fc_retained_frac', 0):.1%})"
+                )
+            print(val_summary)
 
             # CSV
             val_csv.write({"epoch": epoch,

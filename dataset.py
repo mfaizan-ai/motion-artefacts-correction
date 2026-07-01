@@ -2,6 +2,8 @@
 Dataset and DataLoader definitions for CycleGAN training, validation, and testing.
 """
 
+import csv
+import json
 import math
 import os
 import random
@@ -423,6 +425,263 @@ class TestFMRIDataset(Dataset):
         }
 
 
+# Sequence datasets for temporal consistency and FC losses
+
+def _build_chunk_path_lookup(chunk_metadata_csv: str) -> Dict[Tuple[str, int], str]:
+    """Build (preprocessed_bold_file, chunk_index) → chunk_nifti_path lookup."""
+    lookup: Dict[Tuple[str, int], str] = {}
+    with open(chunk_metadata_csv) as f:
+        for row in csv.DictReader(f):
+            key = (row["preprocessed_bold_file"], int(row["chunk_index"]))
+            lookup[key] = row["chunk_nifti_path"]
+    return lookup
+
+
+def _load_manifest_sequences(manifest_csv: str, split: str) -> List[dict]:
+    """Load manifest rows for a given split."""
+    sequences = []
+    with open(manifest_csv) as f:
+        for row in csv.DictReader(f):
+            if row["split"] == split:
+                sequences.append(row)
+    if not sequences:
+        raise FileNotFoundError(
+            f"No sequences for split '{split}' in {manifest_csv}"
+        )
+    return sequences
+
+
+def _load_and_normalise_sequence(
+    chunk_paths: List[str],
+) -> Tuple[Tensor, Tensor, Tuple[int, int, int]]:
+    """
+    Load S ordered chunks and PSC-normalise them with ONE shared baseline
+    computed over the full S*T-volume sequence (not per-chunk).
+
+    Normalising each 5-volume chunk independently (its own local mean) acts
+    like a high-pass filter with a 5-volume cutoff — any real signal that
+    varies on a timescale longer than one chunk gets erased at every chunk
+    boundary, which directly undermines temporal_consistency_loss and
+    fc_loss (both operate on the full stitched 50-volume sequence and rely
+    on a temporally consistent baseline).
+
+    Args:
+        chunk_paths: ordered list of S chunk NIfTI paths for one sequence
+
+    Returns:
+        A_seq      : (S, T, X, Y, Z) PSC-normalised, single shared baseline
+        mean_vol_A : (S, 1, X, Y, Z) the same shared mean_vol repeated S
+                     times, so callers can keep treating it as per-chunk
+                     for shape compatibility (psc_denormalise, etc.)
+        orig_shape : (X, Y, Z) original spatial dims, from the first chunk
+    """
+    raws = []
+    orig_shape = None
+    for path in chunk_paths:
+        raw, orig = _load_nifti(path)            # (T, 80, 96, 72)
+        raws.append(raw)
+        if orig_shape is None:
+            orig_shape = orig
+
+    S = len(raws)
+    T = raws[0].shape[0]
+    raw_seq = torch.cat(raws, dim=0)               # (S*T, 80, 96, 72)
+    psc_seq, mean_vol = _psc_normalise(raw_seq)    # mean_vol: (1, 80, 96, 72)
+
+    A_seq = psc_seq.reshape(S, T, *psc_seq.shape[1:])
+    mean_vol_A = mean_vol.unsqueeze(0).expand(S, -1, -1, -1, -1).clone()
+
+    return A_seq, mean_vol_A, orig_shape
+
+
+class TrainSequenceDataset(Dataset):
+    """
+    Sequence-aware unpaired CycleGAN training dataset.
+
+    Domain A: ordered sequences of video-state chunks (from manifest).
+    Domain B: random resting-state low-motion chunks (one per sequence position).
+
+    Each sample returns S chunks for both domains, stacked along dim 0.
+    Use with DataLoader batch_size=1 — the sequence dim S acts as the
+    effective batch for the model forward pass.
+
+    Batch dict keys
+    ---------------
+    "A"            : (S, T, 80, 96, 72)  PSC, ordered sequence
+    "B"            : (S, T, 80, 96, 72)  PSC, random unpaired
+    "mean_vol_A"   : (S, 1, 80, 96, 72)
+    "mean_vol_B"   : (S, 1, 80, 96, 72)
+    "orig_shape_A" : (X, Y, Z)  tuple — same for all chunks in a sequence
+    "orig_shape_B" : (X, Y, Z)  tuple
+    "path_A"       : str  preprocessed BOLD file for the sequence
+    "path_B"       : str  literal "sequence"
+    """
+
+    def __init__(
+        self,
+        manifest_csv: str,
+        chunk_metadata_csv: str,
+        b_motion_free_dir: str,
+        split: str = "train",
+        augment: bool = False,
+    ):
+        super().__init__()
+        self.augment = augment
+
+        self.sequences = _load_manifest_sequences(manifest_csv, split)
+        self.path_lookup = _build_chunk_path_lookup(chunk_metadata_csv)
+
+        self.files_B = _collect_files(b_motion_free_dir)
+        self._len_B = len(self.files_B)
+
+        self.seq_length = int(self.sequences[0]["sequence_length"])
+
+        print(
+            f"[TrainSequenceDataset] split={split}  "
+            f"sequences={len(self.sequences)}  "
+            f"seq_length={self.seq_length}  "
+            f"B_files={self._len_B}  "
+            f"target-spatial={TARGET_SPATIAL}"
+        )
+
+    def on_epoch_start(self) -> None:
+        """API-compatible with TrainFMRIDataset. DataLoader shuffle handles ordering."""
+        pass
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def _resolve_chunk_paths(self, row: dict) -> List[str]:
+        """Resolve ordered chunk NIfTI paths for one manifest sequence row."""
+        chunks_info = json.loads(row["ordered_chunk_paths"])
+        bold_file = row["preprocessed_bold_file"]
+        paths = []
+        for ci in chunks_info:
+            key = (bold_file, ci["chunk_index"])
+            if key not in self.path_lookup:
+                raise FileNotFoundError(
+                    f"Chunk not found in metadata: bold={bold_file} "
+                    f"chunk_index={ci['chunk_index']}"
+                )
+            paths.append(self.path_lookup[key])
+        return paths
+
+    def __getitem__(self, idx: int) -> Dict[str, object]:
+        row = self.sequences[idx]
+        chunk_paths = self._resolve_chunk_paths(row)
+
+        A_seq, mean_vol_A, orig_shape_a = _load_and_normalise_sequence(chunk_paths)
+
+        b_pscs, b_means = [], []
+        orig_shape_b = None
+        for _ in chunk_paths:
+            bi = random.randrange(self._len_B)
+            raw, orig = _load_nifti(self.files_B[bi])
+            psc, mv = _psc_normalise(raw)
+            b_pscs.append(psc)
+            b_means.append(mv)
+            if orig_shape_b is None:
+                orig_shape_b = orig
+
+        B = torch.stack(b_pscs, dim=0)
+        mean_vol_B = torch.stack(b_means, dim=0)
+
+        if self.augment:
+            if random.random() > 0.5:
+                A_seq = torch.flip(A_seq, dims=[2])
+                mean_vol_A = torch.flip(mean_vol_A, dims=[2])
+            if random.random() > 0.5:
+                B = torch.flip(B, dims=[2])
+                mean_vol_B = torch.flip(mean_vol_B, dims=[2])
+
+        return {
+            "A":            A_seq,
+            "B":            B,
+            "mean_vol_A":   mean_vol_A,
+            "mean_vol_B":   mean_vol_B,
+            "orig_shape_A": orig_shape_a,
+            "orig_shape_B": orig_shape_b,
+            "path_A":       row["preprocessed_bold_file"],
+            "path_B":       "sequence",
+            "subject_id":   row["subject_id"],
+        }
+
+
+class ValSequenceDataset(Dataset):
+    """
+    Sequence-aware validation dataset. Fixed B pairing, no augmentation.
+    Same batch dict keys as TrainSequenceDataset.
+    """
+
+    def __init__(
+        self,
+        manifest_csv: str,
+        chunk_metadata_csv: str,
+        b_motion_free_dir: str,
+        split: str = "val",
+    ):
+        super().__init__()
+
+        self.sequences = _load_manifest_sequences(manifest_csv, split)
+        self.path_lookup = _build_chunk_path_lookup(chunk_metadata_csv)
+
+        self.files_B = _collect_files(b_motion_free_dir)
+        self._len_B = len(self.files_B)
+
+        self._b_order = list(range(self._len_B))
+        random.shuffle(self._b_order)
+
+        self.seq_length = int(self.sequences[0]["sequence_length"])
+
+        print(
+            f"[ValSequenceDataset]   split={split}  "
+            f"sequences={len(self.sequences)}  "
+            f"seq_length={self.seq_length}  "
+            f"B_files={self._len_B}  "
+            f"target-spatial={TARGET_SPATIAL}"
+        )
+
+    def _resolve_chunk_paths(self, row: dict) -> List[str]:
+        chunks_info = json.loads(row["ordered_chunk_paths"])
+        bold_file = row["preprocessed_bold_file"]
+        return [
+            self.path_lookup[(bold_file, ci["chunk_index"])]
+            for ci in chunks_info
+        ]
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def __getitem__(self, idx: int) -> Dict[str, object]:
+        row = self.sequences[idx]
+        chunk_paths = self._resolve_chunk_paths(row)
+
+        A_seq, mean_vol_A, orig_shape_a = _load_and_normalise_sequence(chunk_paths)
+
+        b_pscs, b_means = [], []
+        orig_shape_b = None
+        for i in range(len(chunk_paths)):
+            bi = self._b_order[(idx * len(chunk_paths) + i) % self._len_B]
+            raw, orig = _load_nifti(self.files_B[bi])
+            psc, mv = _psc_normalise(raw)
+            b_pscs.append(psc)
+            b_means.append(mv)
+            if orig_shape_b is None:
+                orig_shape_b = orig
+
+        return {
+            "A":            A_seq,
+            "B":            torch.stack(b_pscs, dim=0),
+            "mean_vol_A":   mean_vol_A,
+            "mean_vol_B":   torch.stack(b_means, dim=0),
+            "orig_shape_A": orig_shape_a,
+            "orig_shape_B": orig_shape_b,
+            "path_A":       row["preprocessed_bold_file"],
+            "path_B":       "sequence",
+            "subject_id":   row["subject_id"],
+        }
+
+
 # DataLoader factory
 def build_dataloaders(
     dataset_root: str,
@@ -436,54 +695,75 @@ def build_dataloaders(
     world_size: int = 1,
     rank: int = 0,
     prefetch_factor: int = 2,
+    sequence_mode: bool = False,
+    manifest_csv: Optional[str] = None,
+    chunk_metadata_csv: Optional[str] = None,
 ) -> Dict[str, DataLoader]:
     """
     Build DataLoaders for any subset of train / val / test splits.
 
     Args:
-        dataset_root   : path to cyclegans_dataset/
-        splits         : e.g. ["train", "val"] or ["test"]. Default: all three.
-        batch_size     : chunks per batch (1 recommended for 3-D fMRI volumes)
-        num_workers    : parallel CPU workers (4–8 on HPC)
-        pin_memory     : faster CPU→GPU transfer; set False on CPU-only nodes
-        cache_limit    : max volumes cached in RAM per dataset (0 = off)
-        augment_train  : random L-R flips on training data
-        distributed    : True for multi-GPU with torch.distributed / SLURM
-        world_size     : total number of DDP processes
-        rank           : this process rank
-        prefetch_factor: batches prefetched per worker
+        dataset_root      : path to cyclegans_dataset/
+        splits            : e.g. ["train", "val"] or ["test"]. Default: all three.
+        batch_size        : chunks per batch (forced to 1 in sequence_mode)
+        num_workers       : parallel CPU workers (4–8 on HPC)
+        pin_memory        : faster CPU→GPU transfer; set False on CPU-only nodes
+        cache_limit       : max volumes cached in RAM per dataset (0 = off)
+        augment_train     : random L-R flips on training data
+        distributed       : True for multi-GPU with torch.distributed / SLURM
+        world_size        : total number of DDP processes
+        rank              : this process rank
+        prefetch_factor   : batches prefetched per worker
+        sequence_mode     : use sequence-aware datasets for temporal/FC losses
+        manifest_csv      : path to video_sequence_manifest.csv (sequence_mode)
+        chunk_metadata_csv: path to video_chunk_metadata_with_paths.csv (sequence_mode)
 
     Returns:
         Dict[str, DataLoader] for the requested splits.
-
-    Examples:
-        # Full pipeline
-        loaders = build_dataloaders("/path/to/cyclegans_dataset")
-
-        # Train + val only
-        loaders = build_dataloaders(root, splits=["train", "val"])
-
-        # Inference only
-        loaders = build_dataloaders(root, splits=["test"],
-                                    batch_size=1, num_workers=2)
     """
     if splits is None:
         splits = ["train", "val", "test"]
 
-    _dataset_builders = {
-        "train": lambda: TrainFMRIDataset(
-            os.path.join(dataset_root, "train"),
-            augment=augment_train,
-            cache_limit=cache_limit,
-        ),
-        "val": lambda: ValFMRIDataset(
-            os.path.join(dataset_root, "val"),
-            cache_limit=cache_limit,
-        ),
-        "test": lambda: TestFMRIDataset(
-            os.path.join(dataset_root, "test"),
-        ),
-    }
+    if sequence_mode:
+        if manifest_csv is None or chunk_metadata_csv is None:
+            raise ValueError(
+                "sequence_mode requires manifest_csv and chunk_metadata_csv"
+            )
+        batch_size = 1
+
+        _dataset_builders = {
+            "train": lambda: TrainSequenceDataset(
+                manifest_csv=manifest_csv,
+                chunk_metadata_csv=chunk_metadata_csv,
+                b_motion_free_dir=os.path.join(dataset_root, "train", "B_motion_free"),
+                split="train",
+                augment=augment_train,
+            ),
+            "val": lambda: ValSequenceDataset(
+                manifest_csv=manifest_csv,
+                chunk_metadata_csv=chunk_metadata_csv,
+                b_motion_free_dir=os.path.join(dataset_root, "val", "B_motion_free"),
+                split="val",
+            ),
+            "test": lambda: TestFMRIDataset(
+                os.path.join(dataset_root, "test"),
+            ),
+        }
+    else:
+        _dataset_builders = {
+            "train": lambda: TrainFMRIDataset(
+                os.path.join(dataset_root, "train"),
+                augment=augment_train,
+                cache_limit=cache_limit,
+            ),
+            "val": lambda: ValFMRIDataset(
+                os.path.join(dataset_root, "val"),
+                cache_limit=cache_limit,
+            ),
+            "test": lambda: TestFMRIDataset(
+                os.path.join(dataset_root, "test"),
+            ),
+        }
 
     loaders: Dict[str, DataLoader] = {}
 
@@ -530,19 +810,40 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--root",
-        default="/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
-                "faizan_motion_correction_dataset/cyclegans_dataset",
+        default="/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/faizan_motion_correction_dataset/cyclegans_chunk5_dataset",
     )
     parser.add_argument("--splits",   nargs="+", default=["train", "val", "test"])
     parser.add_argument("--workers",  type=int,  default=4)
     parser.add_argument("--batch",    type=int,  default=1)
     parser.add_argument("--psc_batches", type=int, default=50,
                         help="Batches to sample per domain for PSC range analysis")
+    parser.add_argument("--sequence_mode", action="store_false",
+                        help="Use sequence-aware loader (TrainSequenceDataset) "
+                             "instead of the flat A_corrupted/B_motion_free loader")
+    parser.add_argument(
+        "--manifest_csv",
+        default="/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
+                "faizan_motion_correction_dataset/cyclegans_chunk5_dataset/"
+                "chunk5_subject_wise_order_video_data/video_sequence_manifest.csv",
+        help="Path to video_sequence_manifest.csv (sequence_mode only)",
+    )
+    parser.add_argument(
+        "--chunk_metadata_csv",
+        default="/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
+                "faizan_motion_correction_dataset/cyclegans_chunk5_dataset/"
+                "chunk5_subject_wise_order_video_data/video_chunk_metadata_with_paths.csv",
+        help="Path to video_chunk_metadata_with_paths.csv (sequence_mode only)",
+    )
     args = parser.parse_args()
 
     print(f"Root          : {args.root}")
     print(f"Splits        : {args.splits}")
-    print(f"Target spatial: {TARGET_SPATIAL}\n")
+    print(f"Target spatial: {TARGET_SPATIAL}")
+    print(f"Sequence mode : {args.sequence_mode}")
+    if args.sequence_mode:
+        print(f"Manifest      : {args.manifest_csv}")
+        print(f"Chunk metadata: {args.chunk_metadata_csv}")
+    print()
 
     loaders = build_dataloaders(
         dataset_root=args.root,
@@ -551,6 +852,9 @@ if __name__ == "__main__":
         num_workers=args.workers,
         pin_memory=torch.cuda.is_available(),
         augment_train=True,
+        sequence_mode=args.sequence_mode,
+        manifest_csv=args.manifest_csv if args.sequence_mode else None,
+        chunk_metadata_csv=args.chunk_metadata_csv if args.sequence_mode else None,
     )
 
     train_loader = loaders.get("train", None)
@@ -558,4 +862,3 @@ if __name__ == "__main__":
     psc_A = batch["A"]
     psc_B = batch["B"]
     print(f'psc_A shape: {psc_A.shape}, psc_B shape: {psc_B.shape}')
-    

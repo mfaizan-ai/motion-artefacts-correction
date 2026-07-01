@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=15:00:00
+#SBATCH --time=10:00:00
 #SBATCH --partition=gpu
 
 
@@ -16,13 +16,16 @@ conda activate moco
 
 export WANDB_MODE=offline
 
+DATA_ROOT=/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/faizan_motion_correction_dataset/cyclegans_chunk5_dataset
+VIDEO_DIR=${DATA_ROOT}/chunk5_subject_wise_order_video_data
+
 python -u train.py \
-    --data_root /lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/faizan_motion_correction_dataset/cyclegans_chunk5_dataset \
+    --data_root ${DATA_ROOT} \
     --in_timepoints 5 \
     --epochs 100 \
     --batch_size 4 \
     --num_workers 8 \
-    --run_name fix_v4 \
+    --run_name seq_v1 \
     --max_grad_norm 3.0 \
     --w_cyc 10.0 \
     --w_idt 5.0 \
@@ -34,4 +37,11 @@ python -u train.py \
     --r1_weight 0.5 \
     --r1_every 8 \
     --no_disc_temporal_diffs \
-    --residual
+    --residual \
+    --use_sequences \
+    --manifest_csv ${VIDEO_DIR}/video_sequence_manifest.csv \
+    --chunk_metadata_csv ${VIDEO_DIR}/video_chunk_metadata_with_paths.csv \
+    --w_temporal 1.0 \
+    --w_fc 0.5 \
+    --fc_mask_strategy threshold \
+    --fc_threshold 0.2
