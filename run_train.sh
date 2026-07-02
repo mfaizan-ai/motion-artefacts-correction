@@ -25,8 +25,7 @@ python -u train.py \
     --epochs 100 \
     --batch_size 4 \
     --num_workers 8 \
-    --run_name tc_only_v1 \
-    --finetune fix_v4/best_model.pt \
+    --run_name tc_only_v2 \
     --max_grad_norm 3.0 \
     --w_cyc 10.0 \
     --w_idt 5.0 \
@@ -42,4 +41,5 @@ python -u train.py \
     --use_sequences \
     --manifest_csv ${VIDEO_DIR}/video_sequence_manifest.csv \
     --chunk_metadata_csv ${VIDEO_DIR}/video_chunk_metadata_with_paths.csv \
-    --w_temporal 1.0
+    --w_temporal 1.0 \
+    --w_fc 0.0

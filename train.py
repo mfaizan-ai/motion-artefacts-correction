@@ -784,7 +784,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to video_chunk_metadata_with_paths.csv")
     p.add_argument("--w_temporal", type=float, default=1.0,
         help="Temporal consistency loss weight (sequence mode)")
-    p.add_argument("--w_fc", type=float, default=0.5,
+    p.add_argument("--w_fc", type=float, default=0.0,
         help="FC preservation loss weight (sequence mode)")
     p.add_argument("--fc_mask_strategy", type=str, default="threshold",
         choices=["threshold", "topk", "percentile"],

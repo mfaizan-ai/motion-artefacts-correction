@@ -11,7 +11,6 @@ Losses:
     4. Content           (MSE in feature space)
     5. Artefact suppression (MSE → 0)
 """
-
 import logging
 from dataclasses import dataclass
 from typing import Dict, Optional
@@ -95,6 +94,7 @@ def adversarial_loss_discriminator(out: ModelOutputs,
 
     return {"D_B": L_D_B, "D_A": L_D_A, "total": L_D_B + L_D_A}
 
+
 # Adversarial generator loss (LSGAN)
 def adversarial_loss_generator(out: ModelOutputs) -> Tensor:
     """
@@ -117,7 +117,6 @@ def cycle_consistency_loss(out: ModelOutputs,
     L1 over L2: preserves sharp temporal transitions in PSC-normalised data.
     """
     return F.l1_loss(out.x_cycle_a, x_a) + F.l1_loss(out.x_cycle_b, x_b)
-
 
 
 # 3. Identity / self-reconstruction loss (L1)
@@ -184,7 +183,6 @@ def temporal_consistency_loss(input_seq: Tensor, corrected_seq: Tensor) -> Tenso
     dy = y[1:] - y[:-1]
     return F.l1_loss(dy, dx)
 
-
 # ROIs with std below this (in PSC units) are treated as degenerate —
 # e.g. an ROI that falls entirely in PSC-zeroed background after nearest-
 # neighbour atlas downsampling has an exactly-constant timeseries. Real
@@ -219,7 +217,6 @@ def _pearson_corr_matrix(X: Tensor) -> Tensor:
         # so autograd never sees an in-place write to a graph tensor.
         diag_fix = torch.diag(degenerate.to(corr.dtype))
         corr = corr + diag_fix
-
     return corr
 
 

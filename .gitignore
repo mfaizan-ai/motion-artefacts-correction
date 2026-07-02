@@ -13,6 +13,8 @@ qc_results/
 runs/
 dataset_quality_check/chunk5/
 ROI_analysis/
+tc_only_v1/
+tc_only_v2/
 
 baseline/
 .vscode
@@ -22,7 +24,7 @@ baseline/
 *.pth
 *.log
 
-test_scrips.py
+test_scripts.py
 
 # Training run outputs
 seq_smoke_test/
