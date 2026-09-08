@@ -158,15 +158,18 @@ def run_evaluation(config: EvalConfig) -> dict:
     fdr_significant[valid], fdr_p[valid], _, _ = multipletests(
         qcfc_p[valid], alpha=config.edge_alpha, method="fdr_bh"
     )
-    median_abs_qcfc = np.median(np.abs(qcfc_r))
+    median_abs_qcfc = np.nanmedian(np.abs(qcfc_r))
     print(f"QC-FC: {fdr_significant.sum()}/{len(qcfc_r)} FDR-significant "
           f"({100 * fdr_significant.sum() / len(qcfc_r):.2f}%), median |r| = {median_abs_qcfc:.4f}")
+    print(f"valid edges: {valid.sum()}, invalid/skipped edges: {(~valid).sum()}")
 
     iu = np.triu_indices(n_rois, k=1)
     dist = build_distance_matrix(config.atlas_path)
+    assert dist.shape == (n_rois, n_rois), "distance matrix ROI count mismatch with edges"
     dist_edges = dist[iu]
-    dd_r, dd_p = stats.pearsonr(dist_edges, qcfc_r)
-    print(f"QC-FC-DD: r={dd_r:.4f}, p={dd_p:.4e}")
+    dd_r, dd_p = stats.pearsonr(dist_edges[valid], qcfc_r[valid])
+    n_valid = valid.sum()
+    print(f"QC-FC-DD: r={dd_r:.4f}, p={dd_p:.4e}, n_valid={n_valid}")
 
     q_fd_r, q_fd_p = stats.pearsonr(q_values, fd)
     print(f"Modularity Q: mean={q_values.mean():.4f}, sd={q_values.std(ddof=1):.4f}")
