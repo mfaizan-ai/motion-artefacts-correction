@@ -5,10 +5,14 @@ train.py
 Training script for Disentangled CycleGAN fMRI motion artefact correction.
 """
 import argparse
+import contextlib
 import csv
 import os
 import random
+import re
 import time
+from collections import defaultdict
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -16,6 +20,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import wandb
 from torch.optim import Adam
 from torch.optim.lr_scheduler import SequentialLR, ConstantLR, LinearLR
@@ -26,10 +34,19 @@ from tqdm import tqdm
 from dataset import build_dataloaders, psc_denormalise, TARGET_SPATIAL  # dataset.py
 from losses  import (generator_loss, discriminator_loss,        # losses.py
                      LossWeights, ModelOutputs,
-                     temporal_consistency_loss, fc_loss)
+                     temporal_consistency_loss, fc_loss,
+                     temporal_discriminator_loss, temporal_generator_loss,
+                     roi_cycle_consistency_loss)
 from atlas_fc import (SchaeferAtlas, load_age_atlases,           # atlas_fc.py
-                      age_group_for_subject, DEFAULT_ATLAS_PATHS)
+                      age_group_for_subject, DEFAULT_ATLAS_PATHS,
+                      SchaeferAtlasCropped, load_age_atlases_cropped, PADDED_SPATIAL)
 from models.model import DisentangledCycleGAN
+from models.st_model import SpatioTemporalCycleGAN
+from models.roi_discriminator import MultiScaleROITemporalDiscriminator
+from grade_dataset import (FMRIUnpairedGradeDataset, worker_init_fn,  # grade_dataset.py
+                           GRADE_A, GRADES_B_ALL, denormalize_chunk,
+                           DEFAULT_CHUNK_METADATA_CSV as GRADE_DEFAULT_CHUNK_CSV,
+                           DEFAULT_RUN_STATS_CSV as GRADE_DEFAULT_STATS_CSV)
 
 
 # fMRI quality metrics
@@ -125,8 +142,10 @@ def r1_gradient_penalty(
 ) -> torch.Tensor:
     real_samples = real_samples.detach().requires_grad_(True)
     d_real = discriminator(real_samples)
+    # multi-scale discriminator returns a list — sum all scale outputs
+    output = sum(s.sum() for s in d_real) if isinstance(d_real, list) else d_real.sum()
     grad_real = torch.autograd.grad(
-        outputs=d_real.sum(),
+        outputs=output,
         inputs=real_samples,
         create_graph=True,
     )[0]
@@ -220,7 +239,7 @@ def build_scheduler(optimiser: Adam,
     decay_steps = n_epochs - half - warmup
 
     s_warmup    = LinearLR(optimiser,
-                           start_factor = 1e-6,
+                           start_factor = 0.01,   # fix3: 1e-6 → 0.01 so epoch 1 has usable LR
                            end_factor   = 1.0,
                            total_iters  = warmup)
 
@@ -248,9 +267,11 @@ def save_checkpoint(
     sched_D,
     best_score: float,
     args:       argparse.Namespace,
+    roi_disc:   Optional[MultiScaleROITemporalDiscriminator] = None,
+    opt_D_roi:  Optional[Adam] = None,
 ) -> None:
     """Save full training state to path."""
-    torch.save({
+    ckpt = {
         "epoch":        epoch,
         "model":        model.state_dict(),
         "opt_G":        opt_G.state_dict(),
@@ -263,7 +284,11 @@ def save_checkpoint(
         "rng_numpy":    np.random.get_state(),
         "rng_python":   random.getstate(),
         "rng_cuda":     torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-    }, path)
+    }
+    if roi_disc is not None:
+        ckpt["roi_disc"]  = roi_disc.state_dict()
+        ckpt["opt_D_roi"] = opt_D_roi.state_dict()
+    torch.save(ckpt, path)
 
 
 def load_checkpoint(
@@ -274,6 +299,9 @@ def load_checkpoint(
     sched_G,
     sched_D,
     device: torch.device,
+    verbose: bool = True,
+    roi_disc:  Optional[MultiScaleROITemporalDiscriminator] = None,
+    opt_D_roi: Optional[Adam] = None,
 ) -> Tuple[int, float]:
     """
     Load training state from checkpoint.
@@ -288,13 +316,26 @@ def load_checkpoint(
     sched_G.load_state_dict(ckpt["sched_G"])
     sched_D.load_state_dict(ckpt["sched_D"])
 
+    if roi_disc is not None:
+        if "roi_disc" in ckpt:
+            roi_disc.load_state_dict(ckpt["roi_disc"])
+            opt_D_roi.load_state_dict(ckpt["opt_D_roi"])
+        elif verbose:
+            print("  WARNING: --use_roi_discriminator is on but this checkpoint has no "
+                  "roi_disc state (saved before it was enabled) -- roi_disc starts from "
+                  "random init instead of resuming.")
+    elif "roi_disc" in ckpt and verbose:
+        print("  WARNING: checkpoint has roi_disc state but --use_roi_discriminator is "
+              "off this run -- that state is being discarded.")
+
     torch.set_rng_state(ckpt["rng_torch"].cpu().byte())
     np.random.set_state(ckpt["rng_numpy"])
     random.setstate(ckpt["rng_python"])
     if ckpt["rng_cuda"] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state(ckpt["rng_cuda"].cpu().byte())
 
-    print(f"  Resumed from epoch {ckpt['epoch']}  best_score={ckpt['best_score']:.4f}")
+    if verbose:
+        print(f"  Resumed from epoch {ckpt['epoch']}  best_score={ckpt['best_score']:.4f}")
     return ckpt["epoch"] + 1, ckpt["best_score"]
 
 # CSV logger
@@ -330,8 +371,6 @@ def get_epoch_weights(
         adv      = base_weights.adv,
         cyc      = 1.0 + (base_weights.cyc - 1.0) * t,
         idt      = 1.0 + (base_weights.idt - 1.0) * t,
-        content  = base_weights.content,
-        art      = base_weights.art,
         temporal = base_weights.temporal,
         fc       = base_weights.fc,
     )
@@ -364,6 +403,49 @@ class ReplayBuffer:
         return torch.cat(out, dim=0)
 
 
+# ROI-timeseries discriminator (models/roi_discriminator.py) support.
+# Operates on raw per-chunk data (T=chunk_size, e.g. 5) -- no sequence
+# stitching needed, unlike temporal_consistency_loss / fc_loss above.
+def _subject_id_from_path(path: str) -> str:
+    """Parse 'ICC103A' out of a filename like 'sub-ICC103A_ses-1_...'."""
+    m = re.search(r"sub-([A-Za-z0-9]+)_", os.path.basename(path))
+    if not m:
+        raise ValueError(f"Could not parse subject_id from path: {path}")
+    return m.group(1)
+
+
+def _extract_roi_ts_batch(
+    volumes: torch.Tensor,
+    paths,
+    atlases: Dict[str, SchaeferAtlas],
+) -> torch.Tensor:
+    """
+    Per-sample ROI-timeseries extraction for a flat (non-sequence) batch.
+
+    Different samples in the same batch can come from different subjects
+    (and therefore different age-appropriate Schaefer atlases, unlike
+    sequence mode where one manifest row == one subject == one atlas), so
+    this resolves the atlas per sample rather than once for the batch.
+
+    Args:
+        volumes: (B, T, X, Y, Z) at the atlases' target_spatial resolution
+        paths:   length-B sequence of source file paths (e.g.
+                 batch["path_A"] / batch["path_B"] from the flat loader)
+        atlases: {"2mo": SchaeferAtlas, "9mo": SchaeferAtlas}
+
+    Returns:
+        (B, n_rois, T) -- ROI axis as channels, ready for
+        MultiScaleROITemporalDiscriminator.
+    """
+    roi_seqs = []
+    for b, path in enumerate(paths):
+        subject_id = _subject_id_from_path(path)
+        atlas = atlases[age_group_for_subject(subject_id)]
+        roi_seqs.append(atlas.extract_roi_timeseries(volumes[b]))  # (T, n_rois)
+    roi_batch = torch.stack(roi_seqs, dim=0)   # (B, T, n_rois)
+    return roi_batch.permute(0, 2, 1)          # (B, n_rois, T)
+
+
 def train_one_epoch(
     model:    DisentangledCycleGAN,
     loader,
@@ -387,6 +469,14 @@ def train_one_epoch(
     fc_threshold:      float = 0.3,
     fc_top_k:          Optional[int] = None,
     fc_percentile:     Optional[float] = None,
+    show_progress:     bool  = True,
+    is_ddp:            bool  = False,  # fix1: manual D grad all-reduce when multi-GPU
+    world_size:        int   = 1,
+    roi_disc:          Optional[MultiScaleROITemporalDiscriminator] = None,
+    opt_D_roi:         Optional[Adam] = None,
+    lambda_roi:        float = 0.5,
+    w_roi_adv:         float = 1.0,
+    w_roi_cycle:       float = 0.0,
 ) -> Dict[str, float]:
     """
     Run one full training epoch.
@@ -394,26 +484,36 @@ def train_one_epoch(
     Returns dict of mean losses over the epoch.
     """
     model.train()
+    raw = model.module if isinstance(model, DDP) else model  # unwrap for param/submodule access
 
     # Accumulators
     acc = {k: 0.0 for k in
-           ["G_adv", "G_cyc", "G_idt", "G_content", "G_art", "G_total",
+           ["G_adv", "G_cyc", "G_idt", "G_total",
             "G_temporal", "G_fc", "G_fc_n_retained", "G_fc_retained_frac",
             "D_A", "D_B", "D_total", "D_r1", "grad_norm_G",
             "score_real_a", "score_fake_a",
-            "score_real_b", "score_fake_b"]}
+            "score_real_b", "score_fake_b",
+            "G_roi_adv", "D_roi_total", "G_roi_cycle"]}
     n_batches = 0
     n_d_updates = 0
     n_r1_updates = 0
     n_fc_updates = 0
+    n_roi_updates = 0
 
     # Advance A queue at the start of each epoch
-    loader.dataset.on_epoch_start()
+    # FMRIUnpairedGradeDataset (grade_dataset.py) uses set_epoch(epoch) (must be seeded by the
+    # real epoch number for reproducible resumes); the flat/sequence datasets in dataset.py use
+    # the no-arg on_epoch_start().
+    if hasattr(loader.dataset, "set_epoch"):
+        loader.dataset.set_epoch(epoch)
+    else:
+        loader.dataset.on_epoch_start()
 
     pbar = tqdm(loader,
                 desc=f"Epoch {epoch:03d} [train]",
                 leave=False,
-                dynamic_ncols=True)
+                dynamic_ncols=True,
+                disable=not show_progress)
 
     last_d_a = 0.0
     last_d_b = 0.0
@@ -421,7 +521,15 @@ def train_one_epoch(
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
             break
+        # grade_dataset.py's FMRIUnpairedGradeDataset uses "A_paths"/"B_paths"; the flat
+        # dataset.py loader uses "path_A"/"path_B" -- same content, different key names.
+        path_a_key = "A_paths" if "A_paths" in batch else "path_A"
+        path_b_key = "B_paths" if "B_paths" in batch else "path_B"
         if use_sequences:
+            assert batch["A"].shape[0] == 1, (  # fix5: squeeze(0) assumes batch_size=1
+                f"Sequence mode requires DataLoader batch_size=1, got {batch['A'].shape[0]}. "
+                "Set --batch_size 1 or let build_dataloaders enforce it."
+            )
             x_a = batch["A"].squeeze(0).to(device)   # (S, T, X, Y, Z)
             x_b = batch["B"].squeeze(0).to(device)   # (S, T, X, Y, Z)
             atlas = atlases[age_group_for_subject(batch["subject_id"][0])] \
@@ -431,10 +539,13 @@ def train_one_epoch(
             x_b = batch["B"].to(device)   # (B, T, X, Y, Z)  motion-free
 
         # Step 1 — Update generators + encoders
-        for p in model.discriminator_parameters():
+        for p in raw.discriminator_parameters():
             p.requires_grad_(False)
-        for p in model.generator_parameters():
+        for p in raw.generator_parameters():
             p.requires_grad_(True)
+        if roi_disc is not None:
+            for p in roi_disc.parameters():
+                p.requires_grad_(False)  # same discipline as D_A/D_B above
 
         out = model(x_a, x_b, detach_fakes_for_D=False)
         g_losses = generator_loss(out, x_a, x_b, weights)
@@ -466,19 +577,41 @@ def train_one_epoch(
                 g_losses["fc"] = L_fc
                 g_losses["fc_stats"] = fc_stats
 
+        # ROI-timeseries adversarial loss (chunk-level, no stitching --
+        # not compatible with sequence mode's (S, T, ...) batch shape)
+        if roi_disc is not None and not use_sequences:
+            fake_roi = _extract_roi_ts_batch(out.x_hat_b, batch[path_a_key], atlases)  # not detached -- grad must reach G
+            g_roi_out = roi_disc(fake_roi)
+            g_roi_losses = temporal_generator_loss(g_roi_out, lambda_roi=lambda_roi)
+            total_loss = total_loss + w_roi_adv * g_roi_losses["total"]
+            g_losses["roi_adv"] = g_roi_losses["total"]
+
+        # ROI-timeseries cycle-consistency loss (chunk-level, no stitching;
+        # independent of roi_disc -- no discriminator needed, just L1
+        # between the input's and the cyclic reconstruction's ROI dynamics)
+        if w_roi_cycle > 0 and atlases is not None and not use_sequences:
+            input_roi_ts = _extract_roi_ts_batch(x_a, batch[path_a_key], atlases)
+            cycle_roi_ts = _extract_roi_ts_batch(out.x_cycle_a, batch[path_a_key], atlases)
+            L_roi_cycle = roi_cycle_consistency_loss(input_roi_ts, cycle_roi_ts)
+            total_loss = total_loss + w_roi_cycle * L_roi_cycle
+            g_losses["roi_cycle"] = L_roi_cycle
+
         opt_G.zero_grad()
         total_loss.backward()
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.generator_parameters(), max_norm=max_grad_norm
+            raw.generator_parameters(), max_norm=max_grad_norm
         ).item()
 
         opt_G.step()
 
         # Step 2 — Update discriminators (every d_update_every steps)
         if i % d_update_every == 0:
-            for p in model.discriminator_parameters():
+            for p in raw.discriminator_parameters():
                 p.requires_grad_(True)
+            if roi_disc is not None:
+                for p in roi_disc.parameters():
+                    p.requires_grad_(True)
 
             # Query replay buffer — mix current fakes with historical ones
             if replay_buffer_a is not None and replay_buffer_b is not None:
@@ -489,32 +622,45 @@ def train_one_epoch(
                 fake_b = out.x_hat_b.detach()
 
             # Run discriminators on reals + buffered fakes (no full model forward)
-            score_real_a = model.D_A(x_a)
-            score_fake_a = model.D_A(fake_a)
-            score_real_b = model.D_B(x_b)
-            score_fake_b = model.D_B(fake_b)
+            score_real_a = raw.D_A(x_a)
+            score_fake_a = raw.D_A(fake_a)
+            score_real_b = raw.D_B(x_b)
+            score_fake_b = raw.D_B(fake_b)
 
-            real_a_target = torch.full_like(score_real_a, label_smooth_real)
-            fake_a_target = torch.full_like(score_fake_a, label_smooth_fake)
-            real_b_target = torch.full_like(score_real_b, label_smooth_real)
-            fake_b_target = torch.full_like(score_fake_b, label_smooth_fake)
+            # LSGAN loss — handles single tensor or multi-scale list
+            def _lsgan_d(scores_real, scores_fake, real_tgt, fake_tgt):
+                if isinstance(scores_real, list):
+                    n = len(scores_real)
+                    return sum(
+                        0.5 * (F.mse_loss(sr, torch.full_like(sr, real_tgt)) +
+                               F.mse_loss(sf, torch.full_like(sf, fake_tgt)))
+                        for sr, sf in zip(scores_real, scores_fake)
+                    ) / n
+                return 0.5 * (F.mse_loss(scores_real, torch.full_like(scores_real, real_tgt)) +
+                              F.mse_loss(scores_fake, torch.full_like(scores_fake, fake_tgt)))
 
-            L_D_A = 0.5 * (F.mse_loss(score_real_a, real_a_target) +
-                           F.mse_loss(score_fake_a, fake_a_target))
-            L_D_B = 0.5 * (F.mse_loss(score_real_b, real_b_target) +
-                           F.mse_loss(score_fake_b, fake_b_target))
+            L_D_A = _lsgan_d(score_real_a, score_fake_a, label_smooth_real, label_smooth_fake)
+            L_D_B = _lsgan_d(score_real_b, score_fake_b, label_smooth_real, label_smooth_fake)
 
             opt_D.zero_grad()
-            (L_D_A + L_D_B).backward()
+            # no_sync suppresses DDP's AccumulateGrad hooks so async NCCL ops
+            # from DDP don't conflict with our explicit manual all_reduce below
+            _nosync = model.no_sync() if is_ddp else contextlib.nullcontext()
+            with _nosync:
+                (L_D_A + L_D_B).backward()
+                if r1_weight > 0 and n_d_updates % r1_every == 0:
+                    r1_a = r1_gradient_penalty(raw.D_A, x_a)
+                    r1_b = r1_gradient_penalty(raw.D_B, x_b)
+                    r1_loss = (r1_weight / 2.0) * (r1_a + r1_b) * r1_every
+                    r1_loss.backward()
+                    acc["D_r1"] += (r1_a + r1_b).item()
+                    n_r1_updates += 1
 
-            if r1_weight > 0 and n_d_updates % r1_every == 0:
-                r1_a = r1_gradient_penalty(model.D_A, x_a)
-                r1_b = r1_gradient_penalty(model.D_B, x_b)
-                r1_loss = (r1_weight / 2.0) * (r1_a + r1_b) * r1_every
-                r1_loss.backward()
-                acc["D_r1"] += (r1_a + r1_b).item()
-                n_r1_updates += 1
-
+            if is_ddp:  # fix1: explicit D grad sync after hooks suppressed
+                for p in raw.discriminator_parameters():
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                        p.grad /= world_size
             opt_D.step()
 
             last_d_a = L_D_A.item()
@@ -524,12 +670,35 @@ def train_one_epoch(
             acc["D_total"] += (L_D_A + L_D_B).item()
             n_d_updates += 1
 
+            # ROI-timeseries temporal discriminator (chunk-level, no stitching)
+            if roi_disc is not None and not use_sequences:
+                real_roi = _extract_roi_ts_batch(x_b, batch[path_b_key], atlases)
+                fake_roi = _extract_roi_ts_batch(out.x_hat_b.detach(), batch[path_a_key], atlases)
+
+                opt_D_roi.zero_grad()
+                real_output = roi_disc(real_roi)
+                fake_output = roi_disc(fake_roi)  # already detached above -- stop grad into G
+                losses_D_roi = temporal_discriminator_loss(
+                    real_output, fake_output, lambda_roi=lambda_roi,
+                )
+                losses_D_roi["total"].backward()
+                if is_ddp:
+                    # roi_disc isn't DDP-wrapped, so this backward has no automatic hooks and
+                    # no no_sync() to suppress (unlike D_A/D_B, which ARE part of the wrapped
+                    # model) -- just average each rank's local gradient directly.
+                    for p in roi_disc.parameters():
+                        if p.grad is not None:
+                            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                            p.grad /= world_size
+                opt_D_roi.step()
+
+                acc["D_roi_total"] += losses_D_roi["total"].item()
+                n_roi_updates += 1
+
         # Accumulate
         acc["G_adv"]     += g_losses["adv"].item()
         acc["G_cyc"]     += g_losses["cyc"].item()
         acc["G_idt"]     += g_losses["idt"].item()
-        acc["G_content"] += g_losses["content"].item()
-        acc["G_art"]     += g_losses["art"].item()
         acc["G_total"]   += total_loss.item()
         acc["grad_norm_G"] += grad_norm
         if "temporal" in g_losses:
@@ -539,10 +708,16 @@ def train_one_epoch(
             acc["G_fc_n_retained"]    += g_losses["fc_stats"]["n_retained"]
             acc["G_fc_retained_frac"] += g_losses["fc_stats"]["retained_fraction"]
             n_fc_updates += 1
-        acc["score_real_a"] += out.score_real_a.mean().item()
-        acc["score_fake_a"] += out.score_fake_a.mean().item()
-        acc["score_real_b"] += out.score_real_b.mean().item()
-        acc["score_fake_b"] += out.score_fake_b.mean().item()
+        if "roi_adv" in g_losses:
+            acc["G_roi_adv"] += g_losses["roi_adv"].item()
+        if "roi_cycle" in g_losses:
+            acc["G_roi_cycle"] += g_losses["roi_cycle"].item()
+        def _score_mean(s):
+            return (s[0] if isinstance(s, list) else s).mean().item()
+        acc["score_real_a"] += _score_mean(out.score_real_a)
+        acc["score_fake_a"] += _score_mean(out.score_fake_a)
+        acc["score_real_b"] += _score_mean(out.score_real_b)
+        acc["score_fake_b"] += _score_mean(out.score_fake_b)
         n_batches += 1
 
         postfix = {
@@ -558,6 +733,10 @@ def train_one_epoch(
         if "fc" in g_losses:
             postfix["fc"] = f"{g_losses['fc'].item():.4f}"
             postfix["fc_n"] = str(g_losses["fc_stats"]["n_retained"])
+        if "roi_adv" in g_losses:
+            postfix["roi_adv"] = f"{g_losses['roi_adv'].item():.4f}"
+        if "roi_cycle" in g_losses:
+            postfix["roi_cyc"] = f"{g_losses['roi_cycle'].item():.4f}"
         pbar.set_postfix(postfix)
 
     result = {k: v / max(n_batches, 1) for k, v in acc.items()}
@@ -569,6 +748,8 @@ def train_one_epoch(
     if n_fc_updates > 0:
         result["G_fc_n_retained"]    = acc["G_fc_n_retained"] / n_fc_updates
         result["G_fc_retained_frac"] = acc["G_fc_retained_frac"] / n_fc_updates
+    if n_roi_updates > 0:
+        result["D_roi_total"] = acc["D_roi_total"] / n_roi_updates
     return result
 
 
@@ -587,12 +768,13 @@ def validate(
     fc_threshold: float = 0.3,
     fc_top_k: Optional[int] = None,
     fc_percentile: Optional[float] = None,
+    show_progress: bool = True,
 ) -> Dict[str, float]:
     """
     Run full validation pass.
 
     Computes:
-        - Generator losses (cyc, idt, content, art) — no adversarial
+        - Generator losses (cyc, idt) — no adversarial
         - fMRI quality metrics on x_a vs x_hat_b (corrected output)
         - Temporal consistency and FC metrics (sequence mode only)
 
@@ -600,7 +782,7 @@ def validate(
     """
     model.eval()
 
-    loss_acc = {k: 0.0 for k in ["cyc", "idt", "content", "art",
+    loss_acc = {k: 0.0 for k in ["cyc", "idt",
                                   "temporal", "fc",
                                   "fc_n_retained", "fc_retained_frac"]}
     metric_acc = {k: 0.0 for k in [
@@ -612,15 +794,31 @@ def validate(
     n_batches = 0
     n_fc_updates = 0
 
+    # Grade-dataset-only metrics, ported from pytorch-CycleGAN-and-pix2pix's validate.py:
+    # residual magnitude by grade, the Grade-1 entry of that same breakdown doubling as the
+    # "identity trend" check, and D_B's score distribution over real-clean/raw-corrupted/
+    # corrected. All computed in the same normalized units the network operates in (that repo's
+    # residual_by_grade/grade1_identity_trend do the same -- no denormalization step there either).
+    residual_l1_by_grade = defaultdict(list)
+    disc_scores = {"real_clean": [], "raw_corrupted": [], "corrected": []}
+
+    def _score_mean(s):
+        return (s[0] if isinstance(s, list) else s).mean().item()
+
     pbar = tqdm(loader,
                 desc=f"Epoch {epoch:03d} [val]  ",
                 leave=False,
-                dynamic_ncols=True)
+                dynamic_ncols=True,
+                disable=not show_progress)
 
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
             break
+        grade_meta_a = None
         if use_sequences:
+            assert batch["A"].shape[0] == 1, (  # fix5: mirrors train_one_epoch guard
+                f"Sequence mode requires DataLoader batch_size=1, got {batch['A'].shape[0]}."
+            )
             x_a = batch["A"].squeeze(0).to(device)
             x_b = batch["B"].squeeze(0).to(device)
             mean_vol_a = batch["mean_vol_A"].squeeze(0).to(device)
@@ -629,16 +827,43 @@ def validate(
         else:
             x_a = batch["A"].to(device)
             x_b = batch["B"].to(device)
-            mean_vol_a = batch["mean_vol_A"].to(device)
+            # Two mutually exclusive denormalization schemes, depending on which dataset
+            # produced this batch (see grade_dataset.py vs dataset.py's _psc_normalise):
+            #   - dataset.py's flat loader: PSC, per-voxel mean_vol_A
+            #   - grade_dataset.py: robust_p5p95, per-sample (median, scale) in A_meta
+            mean_vol_a = batch.get("mean_vol_A")
+            if mean_vol_a is not None:
+                mean_vol_a = mean_vol_a.to(device)
+            grade_meta_a = batch.get("A_meta")
 
         out = model(x_a, x_b)
 
         # Losses (no adversarial at val time)
         g = generator_loss(out, x_a, x_b, weights)
-        loss_acc["cyc"]     += g["cyc"].item()
-        loss_acc["idt"]     += g["idt"].item()
-        loss_acc["content"] += g["content"].item()
-        loss_acc["art"]     += g["art"].item()
+        loss_acc["cyc"] += g["cyc"].item()
+        loss_acc["idt"] += g["idt"].item()
+
+        if grade_meta_a is not None:
+            grade_meta_b = batch["B_meta"]
+
+            # Residual magnitude by grade: out.x_hat_b is already G_B(x_a) -- reuse it rather
+            # than a second forward pass. Also run the SAME correction pipeline on x_b (Grade 1,
+            # already clean) via model.correct(), which G_B never sees during normal training --
+            # this is the "what if you feed it already-clean data" probe.
+            l1_a = (out.x_hat_b - x_a).abs().mean(dim=(1, 2, 3, 4))
+            for grade, l1 in zip(grade_meta_a["grade"], l1_a.tolist()):
+                residual_l1_by_grade[grade].append(l1)
+
+            gb_on_b = model.correct(x_b)
+            l1_b = (gb_on_b - x_b).abs().mean(dim=(1, 2, 3, 4))
+            for grade, l1 in zip(grade_meta_b["grade"], l1_b.tolist()):
+                residual_l1_by_grade[grade].append(l1)
+
+            # D_B score distribution: real clean (x_b) vs raw uncorrected corrupted (x_a) vs
+            # corrected (out.x_hat_b, already scored as out.score_fake_b -- reused, not recomputed)
+            disc_scores["real_clean"].append(_score_mean(out.score_real_b))
+            disc_scores["raw_corrupted"].append(_score_mean(model.D_B(x_a)))
+            disc_scores["corrected"].append(_score_mean(out.score_fake_b))
 
         # Sequence-specific losses
         if use_sequences:
@@ -666,21 +891,35 @@ def validate(
                 loss_acc["fc_retained_frac"] += fc_stats["retained_fraction"]
                 n_fc_updates += 1
 
-        # fMRI metrics: denormalise to raw BOLD space so metrics are meaningful
-        bold_input     = psc_denormalise(x_a, mean_vol_a)
-        bold_corrected = psc_denormalise(out.x_hat_b, mean_vol_a)
-        metrics = compute_fmri_metrics(bold_input, bold_corrected)
-        for k, v in metrics.items():
-            metric_acc[k] += v
+        # fMRI metrics: denormalise to raw BOLD space so metrics are meaningful.
+        metrics = {}
+        if mean_vol_a is not None:
+            bold_input     = psc_denormalise(x_a, mean_vol_a)
+            bold_corrected = psc_denormalise(out.x_hat_b, mean_vol_a)
+            metrics = compute_fmri_metrics(bold_input, bold_corrected)
+        elif grade_meta_a is not None:
+            median_a = grade_meta_a["median"].to(device)
+            scale_a  = grade_meta_a["scale"].to(device)
+            # Ground-truth mask from the real input, NOT the model's own output -- x_hat_b has
+            # no constraint keeping background at 0, so deriving the mask from x_hat_b itself
+            # would treat an untrained/imperfect model's background noise as real tissue.
+            brain_mask = x_a != 0
+            bold_input     = denormalize_chunk(x_a, median_a, scale_a, brain_mask)
+            bold_corrected = denormalize_chunk(out.x_hat_b, median_a, scale_a, brain_mask)
+            metrics = compute_fmri_metrics(bold_input, bold_corrected)
+        if metrics:
+            for k, v in metrics.items():
+                metric_acc[k] += v
 
         n_batches += 1
 
         postfix = {
             "cyc":       f"{g['cyc'].item():.3f}",
             "idt":       f"{g['idt'].item():.3f}",
-            "tSNR↑":     f"{metrics['tsnr_improvement']:+.3f}",
-            "DVARS↓":    f"{metrics['dvars_improvement']:+.3f}",
         }
+        if metrics:
+            postfix["tSNR↑"]  = f"{metrics['tsnr_improvement']:+.3f}"
+            postfix["DVARS↓"] = f"{metrics['dvars_improvement']:+.3f}"
         if use_sequences and weights.temporal > 0:
             postfix["tc"] = f"{loss_acc['temporal']/n_batches:.4f}"
         pbar.set_postfix(postfix)
@@ -694,8 +933,19 @@ def validate(
     for k, v in metric_acc.items():
         results[f"val_{k}"] = v / max(n_batches, 1)
 
-    return results
+    if residual_l1_by_grade:
+        for grade, vals in residual_l1_by_grade.items():
+            results[f"val_residual_l1_{grade.replace(' ', '')}"] = float(np.mean(vals))
+        # Same number as the "Grade1" entry above, re-exposed under its own name for
+        # parity with validate.py's grade1_identity_trend -- not recomputed.
+        if GRADE_A in residual_l1_by_grade:
+            results["val_grade1_identity_l1"] = float(np.mean(residual_l1_by_grade[GRADE_A]))
+    if disc_scores["real_clean"]:
+        results["val_disc_score_real_clean"]    = float(np.mean(disc_scores["real_clean"]))
+        results["val_disc_score_raw_corrupted"] = float(np.mean(disc_scores["raw_corrupted"]))
+        results["val_disc_score_corrected"]     = float(np.mean(disc_scores["corrected"]))
 
+    return results
 
 
 # Argument parser
@@ -720,6 +970,21 @@ def parse_args() -> argparse.Namespace:
              "Unlike --resume, optimizer/scheduler/epoch are NOT restored — "
              "training starts fresh from epoch 1 with new LR schedule.")
 
+    # Grade dataset (motion_grades_chunk_5_dataset_hfiltered: unpaired Grade1 vs
+    # pooled Grade2-6, see grade_dataset.py). Mutually exclusive with the
+    # cyclegans_dataset A_corrupted/B_motion_free loader above.
+    p.add_argument("--use_grade_dataset", action="store_true",
+        help="Train on motion_grades_chunk_5_dataset_hfiltered (Grade1 vs pooled "
+             "Grade2-6) instead of the flat A_corrupted/B_motion_free dataset. "
+             "Spatial dims are fixed at (64,72,56) for this dataset (see "
+             "atlas_fc.PADDED_SPATIAL) -- overrides --in_timepoints' spatial_dims.")
+    p.add_argument("--grade_chunk_metadata_csv", type=str, default=GRADE_DEFAULT_CHUNK_CSV,
+        help="chunk_metadata.csv for the grade dataset")
+    p.add_argument("--grade_run_stats_csv", type=str, default=GRADE_DEFAULT_STATS_CSV,
+        help="run_normalization_stats.csv for the grade dataset -- must be computed "
+             "against the SAME (hfiltered vs unfiltered) source as "
+             "--grade_chunk_metadata_csv, or normalization will use the wrong stats")
+
     # Training configs 
     p.add_argument("--epochs",      type=int,   default=300)
     p.add_argument("--batch_size",  type=int,   default=4)
@@ -731,6 +996,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup",      type=int,   default=5,
         help="LR warmup epochs")
     p.add_argument("--seed",        type=int,   default=42)
+    p.add_argument("--deterministic", action="store_true",
+        help="Force cudnn deterministic mode (slower; default uses cudnn.benchmark for speed)")
 
     # Optimiser
     p.add_argument("--lr_G",   type=float, default=2e-4, help="Generator LR")
@@ -742,8 +1009,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w_adv",     type=float, default=1.0)
     p.add_argument("--w_cyc",     type=float, default=10.0)
     p.add_argument("--w_idt",     type=float, default=5.0)
-    p.add_argument("--w_content", type=float, default=0.0)
-    p.add_argument("--w_art",     type=float, default=0.1)
 
     # Training stabilisation of the discriminator
     p.add_argument("--max_grad_norm",     type=float, default=10.0,
@@ -770,10 +1035,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--global_code_dim",  type=int, default=64)
     p.add_argument("--spatial_code_ch",  type=int, default=32)
     p.add_argument("--disc_base_ch",     type=int, default=64)
+    p.add_argument("--num_disc_scales",  type=int, default=2,
+        help="Number of scales in the multi-scale PatchGAN discriminator")
     p.add_argument("--no_disc_temporal_diffs", action="store_true",
-        help="Disable temporal difference channels in discriminator input")
+        help="Disable temporal difference channels in discriminator input (now off by default)")
     p.add_argument("--residual", action="store_true",
         help="Residual learning: decoders predict delta, added to input via skip connection")
+    p.add_argument("--use_st_model", action="store_true",
+        help="Use SpatioTemporalCycleGAN (factorized R(3+1)D) instead of DisentangledCycleGAN")
 
     # Sequence training (temporal consistency + FC losses)
     p.add_argument("--use_sequences", action="store_true",
@@ -806,6 +1075,27 @@ def parse_args() -> argparse.Namespace:
         help="Schaefer-400 atlas (nihpd-08-11) for 9mo subjects "
              "(subject_id ends with 'A')")
 
+    # ROI-timeseries temporal discriminator (chunk-level, no sequence
+    # stitching needed -- see models/roi_discriminator.py)
+    p.add_argument("--use_roi_discriminator", action="store_true",
+        help="Adversarially match ROI-timeseries realism via "
+             "MultiScaleROITemporalDiscriminator, operating directly on "
+             "raw per-chunk ROI timeseries. Not compatible with "
+             "--use_sequences (chunk-level only).")
+    p.add_argument("--lambda_roi", type=float, default=0.5,
+        help="Weight on the per-ROI term vs. the whole-brain global term "
+             "inside temporal_discriminator_loss / temporal_generator_loss")
+    p.add_argument("--w_roi_adv", type=float, default=1.0,
+        help="Generator-side weight on the ROI-timeseries adversarial loss")
+    p.add_argument("--lr_D_roi", type=float, default=None,
+        help="LR for the ROI discriminator's optimizer (default: --lr_D)")
+    p.add_argument("--w_roi_cycle", type=float, default=0.0,
+        help="Weight on the ROI-timeseries cycle-consistency loss "
+             "(x_a vs x_cycle_a, in ROI space) -- chunk-level, no "
+             "--use_sequences needed, and independent of "
+             "--use_roi_discriminator (no discriminator required). "
+             "0 = disabled (default).")
+
     # Smoke testing
     p.add_argument("--max_train_batches", type=int, default=None,
         help="Cap train batches per epoch (smoke testing)")
@@ -825,44 +1115,77 @@ def parse_args() -> argparse.Namespace:
         p.error("--fc_mask_strategy=topk requires --fc_top_k to be set")
     if args.fc_mask_strategy == "percentile" and args.fc_percentile is None:
         p.error("--fc_mask_strategy=percentile requires --fc_percentile to be set")
+    if args.use_roi_discriminator and args.use_sequences:
+        p.error("--use_roi_discriminator is chunk-level only (operates on the "
+                 "flat (B, T, ...) batch shape) and isn't wired up for "
+                 "--use_sequences's (S, T, ...) batch shape")
+    if args.w_roi_cycle > 0 and args.use_sequences:
+        p.error("--w_roi_cycle is chunk-level only, same as "
+                 "--use_roi_discriminator -- not wired up for --use_sequences")
+    if args.use_grade_dataset and args.use_sequences:
+        p.error("--use_grade_dataset is a flat (unpaired, non-sequence) dataset, "
+                 "same as the default A_corrupted/B_motion_free loader -- not "
+                 "compatible with --use_sequences")
 
     return args
 
 
 # Reproducibility
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, deterministic: bool = True) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark     = False
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark     = False
+    else:
+        torch.backends.cudnn.benchmark     = True  # fix4: faster when --deterministic not set
 
 def main() -> None:
-    args   = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args = parse_args()
 
-    set_seed(args.seed)
+    # ── DDP initialisation ────────────────────────────────────────────────────
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    is_ddp     = local_rank >= 0
 
-  
+    if is_ddp:
+        dist.init_process_group(backend="nccl", timeout=timedelta(minutes=480))  # non-main ranks wait here during rank-0 validation
+        rank       = dist.get_rank()
+        world_size = dist.get_world_size()
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank       = 0
+        world_size = 1
+        device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    is_main = (rank == 0)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    set_seed(args.seed + rank, deterministic=args.deterministic)  # different seed per rank to diversify augmentation
+
     # Run directory
     if args.run_name is None:
         args.run_name = f"run_{int(time.time())}"
 
     run_dir = Path(args.ckpt_root) / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\nRun directory : {run_dir}")
-    print(f"Device        : {device}")
-    if torch.cuda.is_available():
-        print(f"GPU           : {torch.cuda.get_device_name(0)}")
-        print(f"VRAM          : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-    
+    if is_main:
+        print(f"\nRun directory : {run_dir}")
+        print(f"Device        : {device}")
+        if is_ddp:
+            print(f"DDP           : {world_size} GPU(s)")
+        if torch.cuda.is_available():
+            print(f"GPU           : {torch.cuda.get_device_name(local_rank if is_ddp else 0)}")
+            print(f"VRAM          : {torch.cuda.get_device_properties(local_rank if is_ddp else 0).total_memory / 1e9:.1f} GB")
+
     # WandB, offline mode for compute nodes without internet
     os.environ.setdefault("WANDB_MODE", "offline")
 
-    if not args.no_wandb:
+    if is_main and not args.no_wandb:
         wandb.init(
             project = args.wandb_project,
             entity  = args.wandb_entity,
@@ -873,15 +1196,15 @@ def main() -> None:
         )
         print(f"WandB         : offline  (sync with: wandb sync {run_dir}/wandb/)")
 
-    # CSV loggers
+    # CSV loggers (rank 0 only)
     train_fields = ["epoch", "lr_G", "lr_D",
-                     "G_adv", "G_cyc", "G_idt", "G_content", "G_art", "G_total",
+                     "G_adv", "G_cyc", "G_idt", "G_total",
                      "D_A", "D_B", "D_total", "D_r1",
                      "grad_norm_G",
                      "score_real_a", "score_fake_a",
                      "score_real_b", "score_fake_b"]
     val_fields   = ["epoch",
-                    "val_cyc", "val_idt", "val_content", "val_art",
+                    "val_cyc", "val_idt",
                     "val_dvars_input",     "val_dvars_corrected",     "val_dvars_improvement",
                     "val_tsnr_input",      "val_tsnr_corrected",      "val_tsnr_improvement",
                     "val_gs_std_input",    "val_gs_std_corrected",    "val_gs_std_improvement",
@@ -890,83 +1213,195 @@ def main() -> None:
     if args.use_sequences:
         train_fields += ["G_temporal", "G_fc", "G_fc_n_retained", "G_fc_retained_frac"]
         val_fields   += ["val_temporal", "val_fc", "val_fc_n_retained", "val_fc_retained_frac"]
+    if args.use_roi_discriminator:
+        train_fields += ["G_roi_adv", "D_roi_total"]
+        # not wired into validate() yet -- train-only metric for now
+    if args.w_roi_cycle > 0:
+        train_fields += ["G_roi_cycle"]
+    if args.use_grade_dataset:
+        # Ported from pytorch-CycleGAN-and-pix2pix's validate.py: residual magnitude by grade,
+        # grade1 identity (same number as val_residual_l1_Grade1, exposed separately for parity
+        # with that script's naming), and D_B's score distribution.
+        val_fields += [f"val_residual_l1_{g.replace(' ', '')}" for g in ["Grade 1"] + list(GRADES_B_ALL)]
+        val_fields += ["val_grade1_identity_l1",
+                       "val_disc_score_real_clean", "val_disc_score_raw_corrupted", "val_disc_score_corrected"]
 
-    train_csv = CSVLogger(path=run_dir / "train_losses.csv", fieldnames=train_fields)
-    val_csv   = CSVLogger(path=run_dir / "val_metrics.csv",  fieldnames=val_fields)
+    if is_main:
+        train_csv = CSVLogger(path=run_dir / "train_losses.csv", fieldnames=train_fields)
+        val_csv   = CSVLogger(path=run_dir / "val_metrics.csv",  fieldnames=val_fields)
 
     # Dataloaders
-    print("\nBuilding dataloaders ...")
+    if is_main:
+        print("\nBuilding dataloaders ...")
     if args.use_sequences:
         if args.manifest_csv is None or args.chunk_metadata_csv is None:
             raise ValueError(
                 "--manifest_csv and --chunk_metadata_csv required "
                 "with --use_sequences"
             )
-        print(f"  Sequence mode enabled")
-        print(f"  Manifest       : {args.manifest_csv}")
-        print(f"  Chunk metadata : {args.chunk_metadata_csv}")
-    loaders = build_dataloaders(
-        dataset_root       = args.data_root,
-        splits             = ["train", "val"],
-        batch_size         = args.batch_size,
-        num_workers        = args.num_workers,
-        pin_memory         = True,
-        augment_train      = True,
-        sequence_mode      = args.use_sequences,
-        manifest_csv       = args.manifest_csv,
-        chunk_metadata_csv = args.chunk_metadata_csv,
-    )
+        if is_main:
+            print(f"  Sequence mode enabled")
+            print(f"  Manifest       : {args.manifest_csv}")
+            print(f"  Chunk metadata : {args.chunk_metadata_csv}")
+    # Train loader: sharded across GPUs with DistributedSampler
+    # Val loader: full set on every rank (validation only runs on rank 0)
+    if args.use_grade_dataset:
+        if is_main:
+            print(f"  Grade dataset enabled: Grade1 vs pooled {GRADES_B_ALL}")
+            print(f"  Chunk metadata : {args.grade_chunk_metadata_csv}")
+            print(f"  Run stats      : {args.grade_run_stats_csv}")
+        train_ds = FMRIUnpairedGradeDataset(
+            split="train", chunk_metadata_csv=args.grade_chunk_metadata_csv,
+            run_stats_csv=args.grade_run_stats_csv, full_coverage=False,
+        )
+        val_ds = FMRIUnpairedGradeDataset(
+            split="val", chunk_metadata_csv=args.grade_chunk_metadata_csv,
+            run_stats_csv=args.grade_run_stats_csv, full_coverage=True,
+        )
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
+        loaders = {
+            "train": DataLoader(
+                train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None),
+                sampler=train_sampler, num_workers=args.num_workers, pin_memory=True,
+                worker_init_fn=worker_init_fn, drop_last=True,
+            ),
+            "val": DataLoader(
+                val_ds, batch_size=args.batch_size, shuffle=False,
+                num_workers=args.num_workers, pin_memory=True, worker_init_fn=worker_init_fn,
+            ),
+        }
+        if is_main:
+            print(f"  train: A={train_ds.A_size} B={train_ds.B_size} epoch_len={len(train_ds)}")
+            print(f"  val  : A={val_ds.A_size} B={val_ds.B_size} epoch_len={len(val_ds)} (full_coverage)")
+    else:
+        _loader_kwargs = dict(
+            dataset_root       = args.data_root,
+            batch_size         = args.batch_size,
+            num_workers        = args.num_workers,
+            pin_memory         = True,
+            augment_train      = True,
+            sequence_mode      = args.use_sequences,
+            manifest_csv       = args.manifest_csv,
+            chunk_metadata_csv = args.chunk_metadata_csv,
+        )
+        loaders = build_dataloaders(
+            splits=["train"], distributed=is_ddp, world_size=world_size, rank=rank,
+            **_loader_kwargs,
+        )
+        loaders.update(build_dataloaders(
+            splits=["val"], distributed=False,
+            **_loader_kwargs,
+        ))
     
     # Model
-    print("Building model ...")
-    model = DisentangledCycleGAN(
-        in_timepoints    = args.in_timepoints,
-        spatial_dims     = (80, 96, 72),
-        content_ch       = args.content_ch,
-        content_base_ch  = args.content_base_ch,
-        content_n_res    = args.content_n_res,
-        artefact_base_ch = args.artefact_base_ch,
-        global_code_dim  = args.global_code_dim,
-        spatial_code_ch  = args.spatial_code_ch,
-        disc_base_ch     = args.disc_base_ch,
-        disc_temporal_diffs = not args.no_disc_temporal_diffs,
-        residual         = args.residual,
-    ).to(device)
+    if is_main:
+        print("Building model ...")
+    model_spatial_dims = PADDED_SPATIAL if args.use_grade_dataset else (80, 96, 72)
+    if is_main:
+        print(f"  spatial_dims: {model_spatial_dims}" + (" (grade dataset)" if args.use_grade_dataset else ""))
+    if args.use_st_model:
+        model = SpatioTemporalCycleGAN(
+            in_timepoints    = args.in_timepoints,
+            spatial_dims     = model_spatial_dims,
+            content_base_ch  = args.content_base_ch,
+            content_n_res    = args.content_n_res,
+            artefact_base_ch = args.artefact_base_ch,
+            global_code_dim  = args.global_code_dim,
+            spatial_code_ch  = args.spatial_code_ch,
+            disc_base_ch     = args.disc_base_ch,
+            num_disc_scales  = args.num_disc_scales,
+            residual         = args.residual,
+        ).to(device)
+    else:
+        model = DisentangledCycleGAN(
+            in_timepoints    = args.in_timepoints,
+            spatial_dims     = model_spatial_dims,
+            content_ch       = args.content_ch,
+            content_base_ch  = args.content_base_ch,
+            content_n_res    = args.content_n_res,
+            artefact_base_ch = args.artefact_base_ch,
+            global_code_dim  = args.global_code_dim,
+            spatial_code_ch  = args.spatial_code_ch,
+            disc_base_ch        = args.disc_base_ch,
+            num_disc_scales     = args.num_disc_scales,
+            disc_temporal_diffs = not args.no_disc_temporal_diffs,
+            residual            = args.residual,
+        ).to(device)
 
-    # Parameter count summary
-    param_counts = model.count_parameters()
-    print("\nParameter counts:")
-    for name, count in param_counts.items():
-        print(f"  {name:<40} {count:>12,}")
+    # Wrap with DDP if multi-GPU
+    if is_ddp:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    raw_model = model.module if is_ddp else model  # access submodules without DDP wrapper
 
-    if not args.no_wandb:
-        wandb.config.update({"param_counts": param_counts})
+    # Parameter count summary (rank 0 only)
+    if is_main:
+        param_counts = raw_model.count_parameters()
+        print("\nParameter counts:")
+        for name, count in param_counts.items():
+            print(f"  {name:<40} {count:>12,}")
+        if not args.no_wandb:
+            wandb.config.update({"param_counts": param_counts})
 
     # Loss weights
     weights = LossWeights(
         adv      = args.w_adv,
         cyc      = args.w_cyc,
         idt      = args.w_idt,
-        content  = args.w_content,
-        art      = args.w_art,
         temporal = args.w_temporal if args.use_sequences else 0.0,
         fc       = args.w_fc       if args.use_sequences else 0.0,
     )
 
-    # Schaefer-400 atlases for FC loss (age-appropriate: 2mo vs 9mo)
+    # Schaefer-400 atlases for FC loss (age-appropriate: 2mo vs 9mo) and/or
+    # the ROI-timeseries temporal discriminator / cycle-consistency loss
     atlases = None
-    if args.use_sequences and weights.fc > 0:
-        print("\nLoading Schaefer-400 atlases ...")
-        atlases = load_age_atlases(
-            target_spatial=TARGET_SPATIAL,
-            atlas_paths={"2mo": args.atlas_2mo_path, "9mo": args.atlas_9mo_path},
-        )
+    if (args.use_sequences and weights.fc > 0) or args.use_roi_discriminator or args.w_roi_cycle > 0:
+        if is_main:
+            print("\nLoading Schaefer-400 atlases ...")
+        if args.use_grade_dataset:
+            # Crop-based (not resize-based) -- matches motion_grades_chunk_5_dataset_hfiltered's
+            # own voxel grid exactly, see atlas_fc.SchaeferAtlasCropped.
+            atlases = load_age_atlases_cropped(
+                atlas_paths={"2mo": args.atlas_2mo_path, "9mo": args.atlas_9mo_path},
+            )
+        else:
+            atlases = load_age_atlases(
+                target_spatial=TARGET_SPATIAL,
+                atlas_paths={"2mo": args.atlas_2mo_path, "9mo": args.atlas_9mo_path},
+            )
 
     # Optimisers
     betas = (args.beta1, args.beta2)
 
-    opt_G = Adam(model.generator_parameters(),     lr=args.lr_G, betas=betas)
-    opt_D = Adam(model.discriminator_parameters(), lr=args.lr_D, betas=betas)
+    opt_G = Adam(raw_model.generator_parameters(),     lr=args.lr_G, betas=betas)
+    opt_D = Adam(raw_model.discriminator_parameters(), lr=args.lr_D, betas=betas)
+
+    # ROI-timeseries temporal discriminator (chunk-level, no stitching)
+    roi_disc  = None
+    opt_D_roi = None
+    if args.use_roi_discriminator:
+        atlas_2mo, atlas_9mo = atlases["2mo"], atlases["9mo"]
+        if atlas_2mo.active_labels != atlas_9mo.active_labels:
+            raise ValueError(
+                "--use_roi_discriminator requires both age-group atlases to "
+                "retain the exact same set of ROIs after downsampling (a "
+                "single MultiScaleROITemporalDiscriminator is shared across "
+                f"both) -- got {atlas_2mo.n_rois} active ROIs for 2mo vs "
+                f"{atlas_9mo.n_rois} for 9mo, or a mismatched ROI set at "
+                "equal counts. Use a target_spatial where both variants "
+                "keep identical ROI coverage."
+            )
+        if is_main:
+            print(f"ROI discriminator: n_rois={atlas_2mo.n_rois}  "
+                  f"lambda_roi={args.lambda_roi}  w_roi_adv={args.w_roi_adv}")
+        roi_disc  = MultiScaleROITemporalDiscriminator(n_rois=atlas_2mo.n_rois).to(device)
+        if is_ddp:
+            # roi_disc is never wrapped in DDP() (see train_one_epoch's manual all_reduce for
+            # why), so it misses DDP's automatic broadcast-from-rank-0-at-construction-time --
+            # every rank built its own random init (set_seed uses a different seed per rank),
+            # so without this every rank starts training a DIFFERENT roi_disc.
+            for p in roi_disc.parameters():
+                dist.broadcast(p.data, src=0)
+        opt_D_roi = Adam(roi_disc.parameters(), lr=args.lr_D_roi or args.lr_D, betas=betas)
 
   
     # Schedulers
@@ -981,30 +1416,38 @@ def main() -> None:
     if args.finetune is not None:
         finetune_path = Path(args.finetune)
         if finetune_path.exists():
-            print(f"\nFine-tuning from {finetune_path} (model weights only) ...")
+            if is_main:
+                print(f"\nFine-tuning from {finetune_path} (model weights only) ...")
             ckpt = torch.load(finetune_path, map_location=device, weights_only=False)
-            model.load_state_dict(ckpt["model"])
-            print(f"  Loaded model weights from epoch {ckpt['epoch']}  "
-                  f"(optimizer/scheduler reset to epoch-1 state)")
+            raw_model.load_state_dict(ckpt["model"])
+            if is_main:
+                print(f"  Loaded model weights from epoch {ckpt['epoch']}  "
+                      f"(optimizer/scheduler reset to epoch-1 state)")
         else:
-            print(f"  Warning: finetune path {finetune_path} not found — starting fresh")
+            if is_main:
+                print(f"  Warning: finetune path {finetune_path} not found — starting fresh")
 
     elif args.resume is not None:
         resume_path = Path(args.resume)
         if resume_path.exists():
-            print(f"\nResuming from {resume_path} ...")
+            if is_main:
+                print(f"\nResuming from {resume_path} ...")
             start_epoch, best_score = load_checkpoint(
-                resume_path, model, opt_G, opt_D, sched_G, sched_D, device
+                resume_path, raw_model, opt_G, opt_D, sched_G, sched_D, device,
+                verbose=is_main, roi_disc=roi_disc, opt_D_roi=opt_D_roi,
             )
         else:
-            print(f"  Warning: resume path {resume_path} not found — starting fresh")
+            if is_main:
+                print(f"  Warning: resume path {resume_path} not found — starting fresh")
 
     # Also check for latest.pt in run_dir automatically
     elif (run_dir / "latest.pt").exists():
-        print(f"\nFound latest.pt in {run_dir} — resuming automatically ...")
+        if is_main:
+            print(f"\nFound latest.pt in {run_dir} — resuming automatically ...")
         start_epoch, best_score = load_checkpoint(
             run_dir / "latest.pt",
-            model, opt_G, opt_D, sched_G, sched_D, device
+            raw_model, opt_G, opt_D, sched_G, sched_D, device,
+            verbose=is_main, roi_disc=roi_disc, opt_D_roi=opt_D_roi,
         )
 
     # Replay buffers for discriminator training stability
@@ -1012,10 +1455,15 @@ def main() -> None:
     replay_buf_b = ReplayBuffer(max_size=50)
 
     # Training loop
-    print(f"\nStarting training: epochs {start_epoch} → {args.epochs}\n")
+    if is_main:
+        print(f"\nStarting training: epochs {start_epoch} → {args.epochs}\n")
 
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
+
+        # Tell DistributedSampler which epoch this is (shuffles differently each epoch)
+        if is_ddp and hasattr(loaders["train"].sampler, "set_epoch"):
+            loaders["train"].sampler.set_epoch(epoch)
 
         #  Train
         epoch_weights = get_epoch_weights(weights, epoch, args.loss_warmup_epochs)
@@ -1036,7 +1484,21 @@ def main() -> None:
             fc_threshold=args.fc_threshold,
             fc_top_k=args.fc_top_k,
             fc_percentile=args.fc_percentile,
+            show_progress=is_main,
+            is_ddp=is_ddp,
+            world_size=world_size,
+            roi_disc=roi_disc,
+            opt_D_roi=opt_D_roi,
+            lambda_roi=args.lambda_roi,
+            w_roi_adv=args.w_roi_adv,
+            w_roi_cycle=args.w_roi_cycle,
         )
+
+        # Barrier: wait for all ranks to finish training before rank 0 does
+        # validation/checkpointing. Without this, non-main ranks advance to the
+        # next epoch and enter DDP forward while rank 0 is still validating → deadlock.
+        if is_ddp:
+            dist.barrier()
 
         # Step schedulers
         sched_G.step()
@@ -1046,49 +1508,50 @@ def main() -> None:
         lr_D = sched_D.get_last_lr()[0]
         epoch_time = time.time() - epoch_start
 
-        # Console summary
-        summary = (
-            f"Epoch {epoch:03d}/{args.epochs}  "
-            f"({epoch_time:.0f}s)  "
-            f"G={train_metrics['G_total']:.4f}  "
-            f"cyc={train_metrics['G_cyc']:.4f}  "
-            f"idt={train_metrics['G_idt']:.4f}  "
-            f"art={train_metrics['G_art']:.4f}  "
-            f"D_A={train_metrics['D_A']:.4f}  "
-            f"D_B={train_metrics['D_B']:.4f}  "
-            f"r1={train_metrics.get('D_r1', 0):.4f}  "
-            f"∇G={train_metrics['grad_norm_G']:.3f}  "
-            f"lr_G={lr_G:.2e}"
-        )
-        if args.use_sequences:
-            summary += (
-                f"  tc={train_metrics['G_temporal']:.4f}  "
-                f"fc={train_metrics['G_fc']:.4f}  "
-                f"fc_pairs={train_metrics.get('G_fc_n_retained', 0):.0f}"
-                f"({train_metrics.get('G_fc_retained_frac', 0):.1%})"
+        if is_main:
+            # Console summary
+            summary = (
+                f"Epoch {epoch:03d}/{args.epochs}  "
+                f"({epoch_time:.0f}s)  "
+                f"G={train_metrics['G_total']:.4f}  "
+                f"cyc={train_metrics['G_cyc']:.4f}  "
+                f"idt={train_metrics['G_idt']:.4f}  "
+                f"D_A={train_metrics['D_A']:.4f}  "
+                f"D_B={train_metrics['D_B']:.4f}  "
+                f"r1={train_metrics.get('D_r1', 0):.4f}  "
+                f"∇G={train_metrics['grad_norm_G']:.3f}  "
+                f"lr_G={lr_G:.2e}"
             )
-        print(summary)
+            if args.use_sequences:
+                summary += (
+                    f"  tc={train_metrics['G_temporal']:.4f}  "
+                    f"fc={train_metrics['G_fc']:.4f}  "
+                    f"fc_pairs={train_metrics.get('G_fc_n_retained', 0):.0f}"
+                    f"({train_metrics.get('G_fc_retained_frac', 0):.1%})"
+                )
+            print(summary)
 
-        # CSV 
-        train_csv.write({
-            "epoch": epoch,
-            "lr_G":  lr_G,
-            "lr_D":  lr_D,
-            **{k: f"{v:.6f}" for k, v in train_metrics.items()},
-        })
-        #  WandB train 
-        if not args.no_wandb:
-            wandb.log({
+            # CSV
+            train_csv.write({
                 "epoch": epoch,
                 "lr_G":  lr_G,
                 "lr_D":  lr_D,
-                **{f"train/{k}": v for k, v in train_metrics.items()},
-            }, step=epoch)
+                **{k: f"{v:.6f}" for k, v in train_metrics.items()},
+            })
+            # WandB train
+            if not args.no_wandb:
+                wandb.log({
+                    "epoch": epoch,
+                    "lr_G":  lr_G,
+                    "lr_D":  lr_D,
+                    **{f"train/{k}": v for k, v in train_metrics.items()},
+                }, step=epoch)
 
-        #  Validation 
-        if epoch % args.val_every == 0:
+        #  Validation (rank 0 only)
+        if is_main and epoch % args.val_every == 0:
+            torch.cuda.empty_cache()  # release training memory before val pass
             val_metrics = validate(
-                model, loaders["val"], epoch_weights, device, epoch,
+                raw_model, loaders["val"], epoch_weights, device, epoch,  # raw_model: no DDP overhead during val
                 use_sequences=args.use_sequences,
                 atlases=atlases,
                 max_batches=args.max_val_batches,
@@ -1138,30 +1601,39 @@ def main() -> None:
             if val_score > best_score:
                 best_score = val_score
                 best_path  = run_dir / "best_model.pt"
-                save_checkpoint(best_path, epoch, model,
+                save_checkpoint(best_path, epoch, raw_model,
                                 opt_G, opt_D, sched_G, sched_D,
-                                best_score, args)
+                                best_score, args, roi_disc=roi_disc, opt_D_roi=opt_D_roi)
                 print(f"  [VAL]  ✓ New best score={best_score:.4f}  saved → {best_path}")
 
-        # Numbered checkpoint every save_every epochs 
-        if epoch % args.save_every == 0:
+        # Numbered checkpoint every save_every epochs (rank 0 only)
+        if is_main and epoch % args.save_every == 0:
             numbered = run_dir / f"epoch_{epoch:03d}.pt"
-            save_checkpoint(numbered, epoch, model,
+            save_checkpoint(numbered, epoch, raw_model,
                             opt_G, opt_D, sched_G, sched_D,
-                            best_score, args)
+                            best_score, args, roi_disc=roi_disc, opt_D_roi=opt_D_roi)
 
-        #  Latest checkpoint every epoch (crash recovery)
-        save_checkpoint(run_dir / "latest.pt", epoch, model,
-                        opt_G, opt_D, sched_G, sched_D,
-                        best_score, args)
+        #  Latest checkpoint every epoch (crash recovery, rank 0 only)
+        if is_main:
+            save_checkpoint(run_dir / "latest.pt", epoch, raw_model,
+                            opt_G, opt_D, sched_G, sched_D,
+                            best_score, args, roi_disc=roi_disc, opt_D_roi=opt_D_roi)
 
-   
+        # Barrier at end of epoch: non-main ranks wait here until rank 0 finishes
+        # saving checkpoints before advancing to the next epoch.
+        if is_ddp:
+            dist.barrier()
+
     # End of training
-    print(f"\nTraining complete.  Best val score: {best_score:.4f}")
-    print(f"Checkpoints saved to: {run_dir}")
-    if not args.no_wandb:
-        wandb.finish()
-        print(f"Sync WandB with: wandb sync {run_dir}/wandb/")
+    if is_main:
+        print(f"\nTraining complete.  Best val score: {best_score:.4f}")
+        print(f"Checkpoints saved to: {run_dir}")
+        if not args.no_wandb:
+            wandb.finish()
+            print(f"Sync WandB with: wandb sync {run_dir}/wandb/")
+
+    if is_ddp:
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

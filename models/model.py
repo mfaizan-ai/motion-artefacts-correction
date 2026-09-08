@@ -20,7 +20,6 @@ Based on:
     MUNIT        (Huang et al. 2018)
     CycleGAN     (Zhu et al.   2017)
 """
-
 from dataclasses import dataclass
 from pathlib import Path
 import torch
@@ -105,7 +104,6 @@ class DisentangledCycleGAN(nn.Module):
     spatial_code_ch : int   spatial artefact map channels (default 32)
     disc_base_ch    : int   discriminator base channels (default 64)
     """
-
     def __init__(self,
                  in_timepoints:    int   = 20,
                  spatial_dims:     tuple = (80, 96, 72),
@@ -116,7 +114,8 @@ class DisentangledCycleGAN(nn.Module):
                  global_code_dim:  int   = 64,
                  spatial_code_ch:  int   = 32,
                  disc_base_ch:     int   = 64,
-                 disc_temporal_diffs: bool = True,
+                 disc_temporal_diffs: bool = False,
+                 num_disc_scales:  int   = 2,
                  residual:         bool  = False):
         super().__init__()
 
@@ -147,7 +146,6 @@ class DisentangledCycleGAN(nn.Module):
             out_channels = in_timepoints,
             n_res_blocks = 4,
         )
-
         #  Motion-corrupted decoder G_A
         self.G_A = MotionCorruptedDecoder(
             content_ch     = content_ch,
@@ -159,13 +157,15 @@ class DisentangledCycleGAN(nn.Module):
 
         #  Discriminators
         self.D_B = MotionFreeDiscriminator(
-            in_timepoints = in_timepoints,
-            base_ch       = disc_base_ch,
+            in_timepoints      = in_timepoints,
+            base_ch            = disc_base_ch,
+            num_scales         = num_disc_scales,
             use_temporal_diffs = disc_temporal_diffs,
         )
         self.D_A = MotionCorruptedDiscriminator(
-            in_timepoints = in_timepoints,
-            base_ch       = disc_base_ch,
+            in_timepoints      = in_timepoints,
+            base_ch            = disc_base_ch,
+            num_scales         = num_disc_scales,
             use_temporal_diffs = disc_temporal_diffs,
         )
 
@@ -207,7 +207,20 @@ class DisentangledCycleGAN(nn.Module):
         a_global, a_spatial = self.E_a(x)
         return content, a_global, a_spatial
 
-    #  Main forward pass 
+    @staticmethod
+    def _masked_residual(base: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+        """
+        base + delta, with delta zeroed outside base's brain mask (base != 0).
+
+        Without this, the residual correction is added everywhere, including background --
+        the decoder has no constraint keeping delta at 0 there, so background (exactly 0 in
+        every real chunk, by construction of the normalization) picks up whatever the decoder
+        happens to output. Masking forces background to stay exactly 0 through every residual
+        connection, matching the real data instead of relying on training to approximate it.
+        """
+        return base + delta * (base != 0)
+
+    # Main forward pass
     def forward(self,
                 x_a: torch.Tensor,
                 x_b: torch.Tensor,
@@ -259,14 +272,12 @@ class DisentangledCycleGAN(nn.Module):
         x_self_b = self.G_B(c_b)
 
         if self.residual:
-            x_hat_b  = x_a + x_hat_b
-            x_hat_a  = x_b + x_hat_a
-            x_self_a = x_a + x_self_a
-            x_self_b = x_b + x_self_b
+            x_hat_b  = self._masked_residual(x_a, x_hat_b)
+            x_hat_a  = self._masked_residual(x_b, x_hat_a)
+            x_self_a = self._masked_residual(x_a, x_self_a)
+            x_self_b = self._masked_residual(x_b, x_self_b)
 
-
-        # PHASE 3 — CYCLIC TRANSLATION
-
+        # PHASE 3 —> CYCLIC TRANSLATION
         # Re-encode the predicted clean output
         # c_hat_b should match c_a if no hallucination occurred
         c_hat_b = self.E_c(x_hat_b)
@@ -285,8 +296,8 @@ class DisentangledCycleGAN(nn.Module):
         x_cycle_b = self.G_B(c_hat_a)
 
         if self.residual:
-            x_cycle_a = x_hat_b + x_cycle_a
-            x_cycle_b = x_hat_a + x_cycle_b
+            x_cycle_a = self._masked_residual(x_hat_b, x_cycle_a)
+            x_cycle_b = self._masked_residual(x_hat_a, x_cycle_b)
 
     
         # DISCRIMINATOR SCORES
@@ -330,7 +341,7 @@ class DisentangledCycleGAN(nn.Module):
             score_real_a = score_real_a,
             score_fake_a = score_fake_a,
         )
-
+        
     # Inference only (no artefact encoder needed)
     def correct(self, x_a: torch.Tensor) -> torch.Tensor:
         """
@@ -350,7 +361,7 @@ class DisentangledCycleGAN(nn.Module):
         c_a = self.E_c(x_a)
         out = self.G_B(c_a)
         if self.residual:
-            out = x_a + out
+            out = self._masked_residual(x_a, out)
         return out
 
     #  Parameter count summary 

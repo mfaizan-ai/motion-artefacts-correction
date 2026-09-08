@@ -12,8 +12,9 @@ Usage:
 """
 
 import argparse
+import math
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
@@ -71,22 +72,27 @@ def add_improvement_arrow(ax: plt.Axes, higher_better: bool) -> None:
                 bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.6))
 
 
-def plot_generator_losses(df: pd.DataFrame, out_dir: Path) -> None:
+def plot_generator_losses(df: pd.DataFrame, out_dir: Path,
+                          show_aux: bool = False) -> None:
     """
-    Six-panel figure showing each generator loss term plus total.
-    Raw values plotted faintly, smoothed curve on top.
+    Generator loss subplots: adv, cyc, idt, temporal consistency, total.
+    With --show_aux_losses: also adds content and artefact suppression panels.
     """
     terms = [
-        ("G_adv",     "Adversarial",       False),
-        ("G_cyc",     "Cycle Consistency", False),
-        ("G_idt",     "Identity",          False),
-        ("G_content", "Content",           False),
-        ("G_art",     "Artefact Suppression", False),
-        ("G_total",   "Total Generator",   False),
+        ("G_adv",      "Adversarial",           False),
+        ("G_cyc",      "Cycle Consistency",      False),
+        ("G_idt",      "Identity",               False),
+        ("G_temporal", "Temporal Consistency",   False),
+        ("G_total",    "Total Generator",        False),
     ]
+    if show_aux:
+        terms.insert(4, ("G_content", "Content",              False))
+        terms.insert(5, ("G_art",     "Artefact Suppression", False))
 
-    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
-    axes      = axes.flatten()
+    ncols = 3
+    nrows = math.ceil(len(terms) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(16, 5 * nrows))
+    axes = axes.flatten()
     fig.suptitle("Generator Losses", fontsize=15, fontweight="bold", y=1.01)
 
     for ax, (col, label, higher) in zip(axes, terms):
@@ -107,7 +113,10 @@ def plot_generator_losses(df: pd.DataFrame, out_dir: Path) -> None:
         ax.set_ylabel("Loss")
         ax.legend(fontsize=8)
         ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True, nbins=6))
-        add_improvement_arrow(ax, higher_better=False)
+        add_improvement_arrow(ax, higher_better=higher)
+
+    for ax in axes[len(terms):]:
+        ax.set_visible(False)
 
     plt.tight_layout()
     save(fig, out_dir, "01_generator_losses.png")
@@ -118,6 +127,13 @@ def plot_discriminator(df: pd.DataFrame, out_dir: Path) -> None:
     2x2 figure: D_A and D_B losses, then real vs fake scores per domain.
     GAN equilibrium is visible when real and fake scores converge to 0.5.
     """
+    required = ["D_A", "D_B", "score_real_a", "score_fake_a",
+                "score_real_b", "score_fake_b"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        print(f"  Skipping discriminator plot — columns not found: {missing}")
+        return
+
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
     fig.suptitle("Discriminator Losses and Scores", fontsize=15,
                  fontweight="bold", y=1.01)
@@ -194,6 +210,12 @@ def plot_grad_lr(df: pd.DataFrame, out_dir: Path) -> None:
     Two-panel figure: gradient norm trajectory and learning rate schedule.
     Gradient norm above clip threshold (1.0) highlighted in red.
     """
+    required = ["grad_norm_G", "lr_G"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        print(f"  Skipping grad/lr plot — columns not found: {missing}")
+        return
+
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle("Gradient Norm and Learning Rate", fontsize=15,
                  fontweight="bold")
@@ -239,23 +261,34 @@ def plot_grad_lr(df: pd.DataFrame, out_dir: Path) -> None:
 
 def plot_val_losses(df_val: pd.DataFrame,
                     df_train: Optional[pd.DataFrame],
-                    out_dir: Path) -> None:
+                    out_dir: Path,
+                    show_aux: bool = False) -> None:
     """
-    Validation losses, optionally overlaid with training equivalents.
-    Useful for spotting overfitting — val and train diverging is the signal.
+    Validation losses: cyc, idt, temporal consistency by default.
+    With --show_aux_losses: also adds content and artefact suppression panels.
     """
-    terms = ["cyc", "idt", "content", "art"]
+    terms = ["cyc", "idt", "temporal"]
     labels = {
-        "cyc":     "Cycle Consistency",
-        "idt":     "Identity",
-        "content": "Content",
-        "art":     "Artefact Suppression",
+        "cyc":      "Cycle Consistency",
+        "idt":      "Identity",
+        "temporal": "Temporal Consistency",
     }
+    if show_aux:
+        terms += ["content", "art"]
+        labels["content"] = "Content"
+        labels["art"]     = "Artefact Suppression"
 
-    fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+    fig, axes = plt.subplots(1, len(terms), figsize=(6 * len(terms), 5))
+    if len(terms) == 1:
+        axes = [axes]
     fig.suptitle("Validation Losses" +
                  (" vs Training Losses" if df_train is not None else ""),
                  fontsize=15, fontweight="bold")
+
+    train_col_map = {
+        "cyc": "G_cyc", "idt": "G_idt",
+        "temporal": "G_temporal", "content": "G_content", "art": "G_art",
+    }
 
     for ax, term in zip(axes, terms):
         val_col = f"val_{term}"
@@ -267,8 +300,9 @@ def plot_val_losses(df_val: pd.DataFrame,
                 color=PALETTE["corrected"], linewidth=2,
                 marker="o", markersize=4, label="Val")
 
-        if df_train is not None and term in df_train.columns:
-            ax.plot(df_train["epoch"], smooth(df_train[term]),
+        train_col = train_col_map.get(term)
+        if df_train is not None and train_col and train_col in df_train.columns:
+            ax.plot(df_train["epoch"], smooth(df_train[train_col]),
                     color=PALETTE["input"], linewidth=1.5,
                     linestyle="--", alpha=0.8, label="Train (smoothed)")
 
@@ -328,7 +362,7 @@ def plot_fmri_metrics(df: pd.DataFrame, out_dir: Path) -> None:
                         color=PALETTE["reference"], alpha=0.2,
                         label="Improvement region")
         ax.fill_between(epochs, y_in, y_cor,
-                        where=~better_mask,
+                        where=np.logical_not(better_mask),
                         color=PALETTE["fake"], alpha=0.15,
                         label="Regression region")
 
@@ -454,6 +488,9 @@ def parse_args() -> argparse.Namespace:
         help="Output directory for plots (default: same directory as CSV)")
     p.add_argument("--smooth_window", type=int, default=SMOOTH_WINDOW,
         help="Rolling mean window for training curve smoothing")
+    p.add_argument("--show_aux_losses", action="store_true", default=False,
+        help="Also plot content and artefact suppression loss panels "
+             "(hidden by default as they are disabled in current runs)")
     return p.parse_args()
 
 
@@ -500,13 +537,13 @@ def main() -> None:
 
     if df_train is not None:
         print("Plotting training figures ...")
-        plot_generator_losses(df_train, out_dir)
+        plot_generator_losses(df_train, out_dir, show_aux=args.show_aux_losses)
         plot_discriminator(df_train, out_dir)
         plot_grad_lr(df_train, out_dir)
 
     if df_val is not None:
         print("Plotting validation figures ...")
-        plot_val_losses(df_val, df_train, out_dir)
+        plot_val_losses(df_val, df_train, out_dir, show_aux=args.show_aux_losses)
         plot_fmri_metrics(df_val, out_dir)
         plot_improvement_trajectory(df_val, out_dir)
         plot_val_score(df_val, out_dir)

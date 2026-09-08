@@ -28,8 +28,6 @@ class LossWeights:
     adv:      float = 1.0
     cyc:      float = 10.0
     idt:      float = 5.0
-    content:  float = 1.0
-    art:      float = 0.1
     temporal: float = 0.0
     fc:       float = 0.0
 
@@ -94,18 +92,20 @@ def adversarial_loss_discriminator(out: ModelOutputs,
 
     return {"D_B": L_D_B, "D_A": L_D_A, "total": L_D_B + L_D_A}
 
+def _ms_gen_adv(scores_fake) -> Tensor:
+    """LSGAN generator loss, handles single tensor or multi-scale list. Averaged across scales."""
+    if isinstance(scores_fake, list):
+        # Multi-scale: average the loss across scales
+        return sum(0.5 * F.mse_loss(s, torch.ones_like(s)) for s in scores_fake) / len(scores_fake) 
+    return 0.5 * F.mse_loss(scores_fake, torch.ones_like(scores_fake))
 
 # Adversarial generator loss (LSGAN)
 def adversarial_loss_generator(out: ModelOutputs) -> Tensor:
     """
-    LSGAN generator loss.
+    LSGAN generator loss — works with single-scale tensor or multi-scale list.
     Generator tries to make discriminator output 1 on fakes.
     """
-    ones_b = torch.ones_like(out.score_fake_b)
-    ones_a = torch.ones_like(out.score_fake_a)
-
-    return (0.5 * F.mse_loss(out.score_fake_b, ones_b) +
-            0.5 * F.mse_loss(out.score_fake_a, ones_a))
+    return _ms_gen_adv(out.score_fake_b) + _ms_gen_adv(out.score_fake_a)
 
 
 # 2. Cycle-consistency loss (L1)
@@ -394,6 +394,121 @@ def fc_loss(input_roi_ts: Tensor,
 
     return F.l1_loss(fc_cor[mask], fc_inp[mask].detach())
 
+# 8. Temporal ROI discriminator loss (LSGAN, MultiScaleROITemporalDiscriminator)
+def temporal_discriminator_loss(
+    real_output: Dict[str, Tensor],
+    fake_output: Dict[str, Tensor],
+    lambda_roi: float = 0.5,
+) -> Dict[str, Tensor]:
+    """
+    LSGAN loss for MultiScaleROITemporalDiscriminator (models/roi_discriminator.py),
+    combining its whole-brain "global" score with its per-ROI "roi" scores.
+
+    Args:
+        real_output: {"global": (B, 1), "roi": (B, n_rois)} — discriminator
+                     output on real ROI timeseries
+        fake_output: {"global": (B, 1), "roi": (B, n_rois)} — discriminator
+                     output on corrected/generated ROI timeseries
+        lambda_roi:  weight on the per-ROI term relative to the global term
+
+    Returns:
+        Dict with "total" (for .backward()) plus the individual components.
+    """
+    # Global real/fake losses
+    loss_global_real = F.mse_loss(
+        real_output["global"], torch.ones_like(real_output["global"])
+    )
+    loss_global_fake = F.mse_loss(
+        fake_output["global"], torch.zeros_like(fake_output["global"])
+    )
+    loss_global = 0.5 * (loss_global_real + loss_global_fake)
+
+    # ROI-wise real/fake losses
+    loss_roi_real = F.mse_loss(
+        real_output["roi"], torch.ones_like(real_output["roi"])
+    )
+    loss_roi_fake = F.mse_loss(
+        fake_output["roi"], torch.zeros_like(fake_output["roi"])
+    )
+    loss_roi = 0.5 * (loss_roi_real + loss_roi_fake)
+
+    # Combined temporal discriminator loss
+    loss_total = loss_global + lambda_roi * loss_roi
+
+    return {
+        "total": loss_total,
+        "global": loss_global,
+        "roi": loss_roi,
+        "global_real": loss_global_real,
+        "global_fake": loss_global_fake,
+        "roi_real": loss_roi_real,
+        "roi_fake": loss_roi_fake,
+    }
+
+def temporal_generator_loss(
+    fake_output: Dict[str, Tensor],
+    lambda_roi: float = 0.5,
+) -> Dict[str, Tensor]:
+    """
+    LSGAN generator loss for MultiScaleROITemporalDiscriminator — the
+    generator tries to make the discriminator output 1 on the corrected/
+    generated ROI timeseries, both at the whole-brain ("global") and
+    per-ROI level.
+
+    Args:
+        fake_output: {"global": (B, 1), "roi": (B, n_rois)} — discriminator
+                     output on corrected/generated ROI timeseries
+        lambda_roi:  weight on the per-ROI term relative to the global term
+                     (should match the value used in temporal_discriminator_loss)
+
+    Returns:
+        Dict with "total" (for .backward()) plus the individual components.
+    """
+    loss_global = F.mse_loss(
+        fake_output["global"], torch.ones_like(fake_output["global"])
+    )
+    loss_roi = F.mse_loss(
+        fake_output["roi"], torch.ones_like(fake_output["roi"])
+    )
+
+    loss_total = loss_global + lambda_roi * loss_roi
+
+    return {
+        "total": loss_total,
+        "global": loss_global,
+        "roi": loss_roi,
+    }
+
+# 9. ROI-timeseries cycle-consistency loss (chunk-level, no stitching)
+def roi_cycle_consistency_loss(
+    input_roi_ts: Tensor,
+    cycle_roi_ts: Tensor,
+) -> Tensor:
+    """
+    L1 cycle-consistency loss on ROI mean-BOLD timeseries.
+
+    Distinct from fc_loss, which compares a single forward hop's *FC
+    (correlation) matrix* (x_a vs x_hat_b) — this compares the *raw*
+    timeseries after the full round trip A->B->A (x_a vs x_cycle_a), the
+    same relationship cycle_consistency_loss already enforces in voxel
+    space (see losses.py #2), just computed in ROI-timeseries space
+    instead. Should decrease as the cyclic reconstruction's ROI dynamics
+    converge back to the real input's.
+
+    Args:
+        input_roi_ts: (B, n_rois, T) ROI timeseries of the real input (x_a)
+        cycle_roi_ts: (B, n_rois, T) ROI timeseries of the cyclic
+                      reconstruction (x_cycle_a, A->B->A)
+
+    Returns:
+        Scalar L1 loss.
+    """
+    assert input_roi_ts.shape == cycle_roi_ts.shape, (
+        f"roi_cycle_consistency_loss: shape mismatch "
+        f"input={tuple(input_roi_ts.shape)} cycle={tuple(cycle_roi_ts.shape)}"
+    )
+    return F.l1_loss(cycle_roi_ts, input_roi_ts.detach())
+
 # Combined losses
 def generator_loss(out: ModelOutputs,
                    x_a: Tensor,
@@ -403,25 +518,19 @@ def generator_loss(out: ModelOutputs,
     Combined weighted generator loss.
     Returns dict with individual terms and 'total' for .backward().
     """
-    L_adv     = adversarial_loss_generator(out)
-    L_cyc     = cycle_consistency_loss(out, x_a, x_b)
-    L_idt     = identity_loss(out, x_a, x_b)
-    L_content = content_loss(out)
-    L_art     = artefact_suppression_loss(out)
+    L_adv = adversarial_loss_generator(out)
+    L_cyc = cycle_consistency_loss(out, x_a, x_b)
+    L_idt = identity_loss(out, x_a, x_b)
 
-    total = (weights.adv     * L_adv     +
-             weights.cyc     * L_cyc     +
-             weights.idt     * L_idt     +
-             weights.content * L_content +
-             weights.art     * L_art)
+    total = (weights.adv * L_adv +
+             weights.cyc * L_cyc +
+             weights.idt * L_idt)
 
     return {
-        "adv":     L_adv,
-        "cyc":     L_cyc,
-        "idt":     L_idt,
-        "content": L_content,
-        "art":     L_art,
-        "total":   total,
+        "adv":   L_adv,
+        "cyc":   L_cyc,
+        "idt":   L_idt,
+        "total": total,
     }
 
 
@@ -509,12 +618,6 @@ if __name__ == "__main__":
     check("identity",
           lambda: identity_loss(out, x_a, x_b))
 
-    check("content",
-          lambda: content_loss(out))
-
-    check("artefact_suppression",
-          lambda: artefact_suppression_loss(out))
-
     # Discriminator loss
     d = adversarial_loss_discriminator(out)
     assert set(d.keys()) == {"D_A", "D_B", "total"}, \
@@ -529,16 +632,14 @@ if __name__ == "__main__":
     # Combined generator loss
     weights = LossWeights()
     g = generator_loss(out, x_a, x_b, weights)
-    expected_keys = {"adv", "cyc", "idt", "content", "art", "total"}
+    expected_keys = {"adv", "cyc", "idt", "total"}
     assert set(g.keys()) == expected_keys, \
         f"generator_loss: missing keys {expected_keys - set(g.keys())}"
 
     # Verify total equals weighted sum
-    expected_total = (weights.adv     * g["adv"]     +
-                      weights.cyc     * g["cyc"]     +
-                      weights.idt     * g["idt"]     +
-                      weights.content * g["content"] +
-                      weights.art     * g["art"])
+    expected_total = (weights.adv * g["adv"] +
+                      weights.cyc * g["cyc"] +
+                      weights.idt * g["idt"])
     assert torch.allclose(g["total"], expected_total, atol=1e-5), \
         "generator_loss: total does not match weighted sum of terms"
     print(f"  [PASS] {'generator_loss (weighted sum)':<35} "
@@ -551,7 +652,7 @@ if __name__ == "__main__":
     tests_passed += 1
 
     # Custom weights check
-    custom = LossWeights(adv=2.0, cyc=5.0, idt=2.5, content=0.5, art=0.05)
+    custom = LossWeights(adv=2.0, cyc=5.0, idt=2.5)
     g_custom = generator_loss(out, x_a, x_b, custom)
     assert torch.isfinite(g_custom["total"]), \
         "generator_loss with custom weights: non-finite total"

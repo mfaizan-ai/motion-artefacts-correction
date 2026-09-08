@@ -29,91 +29,78 @@ This single discrimintor coudl be used for both domains (motion-corrupted and cl
 
 import torch
 from torch import nn
+from typing import List, Union
 from models.building_blocks import DiscConvBlock, append_temporal_diffs
 
-class PatchDiscriminator3D(nn.Module):
+
+def _make_scale_cnn(in_ch: int, base_ch: int) -> nn.Sequential:
+    """Single-scale PatchGAN CNN: 4 strided-conv blocks + spectral-norm output conv."""
+    c = base_ch
+    return nn.Sequential(
+        DiscConvBlock(in_ch, c,     use_norm=False),
+        DiscConvBlock(c,     c * 2, use_norm=True),
+        DiscConvBlock(c * 2, c * 4, use_norm=True),
+        DiscConvBlock(c * 4, c * 8, use_norm=True),
+        nn.utils.spectral_norm(nn.Conv3d(c * 8, 1, kernel_size=3, padding=1, bias=True)),
+    )
+
+
+class MultiScalePatchDiscriminator3D(nn.Module):
     """
-    3D PatchGAN discriminator with temporal difference augmentation.
- 
-    Produces a spatial map of patch-level real/fake scores rather than
-    a single global score. Each value in the output grid independently
-    judges a local overlapping patch of the input chunk.
- 
-    Input preparation:
-        Original chunk (B, T, D, H, W) is augmented with T-1 temporal
-        difference maps to give (B, 2T-1, D, H, W) before the first conv.
- 
-    Architecture (4 strided conv blocks + output conv):
-        Block 1 : (B, 2T-1, 80, 96, 72) → (B,  64, 40, 48, 36)  no norm
-        Block 2 : (B,  64,  40, 48, 36) → (B, 128, 20, 24, 18)  InstanceNorm
-        Block 3 : (B, 128,  20, 24, 18) → (B, 256, 10, 12,  9)  InstanceNorm
-        Block 4 : (B, 256,  10, 12,  9) → (B, 512,  5,  6,  4)  InstanceNorm
-        Out conv: (B, 512,   5,  6,  4) → (B,   1,  5,  6,  4)  no norm
- 
-    Output: (B, 1, 5, 6, 4)
-        120 independent patch scores per sample.
-        Each patch covers ~16×16×18 voxels in the original volume.
- 
-    Loss (LSGAN):
-        Discriminator: E[(D(real)-1)²] + E[(D(fake))²]
-        Generator:     E[(D(fake)-1)²]
-        Implemented externally in the training loop.
- 
+    Multi-scale 3D PatchGAN discriminator (adapted from DC-MS-GANs MsImageDis).
+
+    Runs `num_scales` independent PatchGAN CNNs on the input at progressively
+    coarser resolutions. Between scales the input is halved with AvgPool3d.
+    Returns a list of score maps (finest scale first).
+
+    Temporal difference channels are OFF by default — appending T-1 diff maps
+    gave the discriminator a large information advantage over the generator,
+    making it trivially easy to detect temporal discontinuities and causing
+    D to dominate (use_temporal_diffs=True to restore old behaviour).
+
     Parameters
     ----------
-    in_timepoints : int   number of input timepoints (default 20)
-    base_ch       : int   channels after first conv block (default 64)
+    in_timepoints      : number of input timepoints / channels
+    base_ch            : channels after first conv in each scale CNN
+    num_scales         : number of scales (default 2)
+    use_temporal_diffs : if True, prepend T-1 frame-diff channels (default False)
     """
- 
+
     def __init__(self,
-                 in_timepoints: int = 20,
-                 base_ch:       int = 64,
-                 use_temporal_diffs: bool = True):
+                 in_timepoints:      int  = 20,
+                 base_ch:            int  = 64,
+                 num_scales:         int  = 2,
+                 use_temporal_diffs: bool = False):
         super().__init__()
 
         self.use_temporal_diffs = use_temporal_diffs
+        self.num_scales         = num_scales
+        self.downsample = nn.AvgPool3d(3, stride=2, padding=1, count_include_pad=False)
 
-        if use_temporal_diffs:
-            in_ch = in_timepoints + (in_timepoints - 1)   # 2T - 1 = 39
-        else:
-            in_ch = in_timepoints                          # T = 20
+        in_ch = (in_timepoints + (in_timepoints - 1)) if use_temporal_diffs else in_timepoints
+        self.cnns = nn.ModuleList([_make_scale_cnn(in_ch, base_ch) for _ in range(num_scales)])
 
-        c = base_ch   # 64
-
-        # Four strided conv blocks — each halves spatial dimensions
-        self.block1 = DiscConvBlock(in_ch, c,     use_norm=False)  # no norm first
-        self.block2 = DiscConvBlock(c,     c * 2, use_norm=True)
-        self.block3 = DiscConvBlock(c * 2, c * 4, use_norm=True)
-        self.block4 = DiscConvBlock(c * 4, c * 8, use_norm=True)
-
-        self.out_conv = nn.utils.spectral_norm(
-            nn.Conv3d(c * 8, 1,
-                      kernel_size=3, padding=1, bias=True)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         if self.use_temporal_diffs:
-            x = append_temporal_diffs(x)       # (B, 2T-1, D, H, W)
+            x = append_temporal_diffs(x)
 
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
+        outputs = []
+        for cnn in self.cnns:
+            outputs.append(cnn(x))
+            x = self.downsample(x)
+        return outputs   # list of score maps, finest first
 
-        return self.out_conv(x)
- 
- 
-  
-class MotionFreeDiscriminator(PatchDiscriminator3D):
+
+class MotionFreeDiscriminator(MultiScalePatchDiscriminator3D):
     """Discriminator for the motion-free domain (D_B)."""
-    def __init__(self, in_timepoints=20, base_ch=64, use_temporal_diffs=True):
-        super().__init__(in_timepoints, base_ch, use_temporal_diffs)
+    def __init__(self, in_timepoints=20, base_ch=64, num_scales=2, use_temporal_diffs=False):
+        super().__init__(in_timepoints, base_ch, num_scales, use_temporal_diffs)
 
 
-class MotionCorruptedDiscriminator(PatchDiscriminator3D):
+class MotionCorruptedDiscriminator(MultiScalePatchDiscriminator3D):
     """Discriminator for the motion-corrupted domain (D_A)."""
-    def __init__(self, in_timepoints=20, base_ch=64, use_temporal_diffs=True):
-        super().__init__(in_timepoints, base_ch, use_temporal_diffs)
+    def __init__(self, in_timepoints=20, base_ch=64, num_scales=2, use_temporal_diffs=False):
+        super().__init__(in_timepoints, base_ch, num_scales, use_temporal_diffs)
  
  
  

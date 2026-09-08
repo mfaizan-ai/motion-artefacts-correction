@@ -1,0 +1,16 @@
+I want to add tempral learning capability to fMRI CycleGAN architecture that we have in model.py to natively handle spatiotemporal data without collapsing the time dimension into the channel dimension. Currently, the code treats timepoints as channels (e.g., input shape `(B,T, X, Y, Z)`). 
+
+I want to transition this to a factorized R(3+1)D approach where time is kept as a distinct dimension `(B, T, X, Y, Z, C)` (where T=chunk size, C=1 for channel as grayscale fMRI volume initially) and temporal information is modeled sequentially using 1D convolutions at every single stage of the network.
+
+Please update my Encoders, Decoders, and Discriminators based on the following implementation rules:
+
+1. Temporal Axis Preservation: Do not flatten T into the channel dimension.
+2. Interleaved R(3+1)D Blocks: At every downsampling block, upsampling block, residual block, and discriminator layer, replace or augment the 3D spatial operations with an interleaved 1D temporal convolution, or maybe do as you think omre suitable liek at each stage we process temporal and spatil information before passing it to aother stage. 
+   - Step A (Spatial): Reshape/permute the tensor to `(B*T, C, X, Y, Z)` to run the existing 3D spatial convolutions/InstanceNorm.
+   - Step B (Temporal): Immediately reshape/permute the resulting tensor to `(B*Spatial, T, C)` and apply a 1D convolution along the T dimension (using `kernel_size=3` or `5` with same-padding to maintain temporal length).
+3. Adaptation: Ensure that Instance Normalization still normalizes each volume at each timepoint independently during the spatial step to maintain motion-invariant properties, or do as you think which way is suitable. 
+
+
+Note: maybe the information provide in this prompt not sufficient but you have now the idea, what 
+to do and how to proceed with it. But make sure you don't chnage thge original code, maybe wriet a seperte model 
+script where you add this feature on top of the original code. 
