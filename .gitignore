@@ -14,6 +14,8 @@ runs/
 dataset_quality_check/chunk5/
 ROI_analysis/
 tc_only_v2/
+all_dataset/
+slurm/
 
 baseline/
 .vscode

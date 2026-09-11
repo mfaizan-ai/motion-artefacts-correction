@@ -1,23 +1,3 @@
-"""
-denoise_runs.py
-================
-Whole-run model correction for the same 128-subject population used by
-denoising_evaluation.py's raw baseline (2mo, non-A, first session/run) --
-produces a corrected dataset mirroring the raw source's directory structure,
-so create_roi_timeseries.py / denoising_evaluation.py can be re-run against
-it unchanged (just point --source_root at the new corrected root) for a
-before/after comparison.
-
-Uses the model's inference-only correct() path (E_c + G_B + masked
-residual). Each run is normalized with its own per-run robust_p5p95
-(median, scale) from run_stats_csv -- the SAME normalization grade_dataset.py
-applies during training -- before chunking into 5-TR windows and correcting,
-then denormalized back to BOLD units afterward. (Earlier drafts of this
-script fed raw un-normalized intensities into the model -- wrong, since the
-model only ever saw normalized input during training. Fixed here.)
-
-Every processed run is appended to a log CSV (never overwritten).
-"""
 import argparse
 import os
 import subprocess
