@@ -30,7 +30,6 @@ from models.encoders       import ContentEncoder,   ArtefactEncoder
 from models.decoders       import MotionFreeDecoder, MotionCorruptedDecoder
 from models.discriminators import (MotionFreeDiscriminator,
                              MotionCorruptedDiscriminator)
-
 # Model outputs dataclass to hold all intermediate tensors from a forward pass
 @dataclass
 class ModelOutputs:

@@ -45,3 +45,11 @@ useful_scripts/check_identity_collapse.py
 useful_scripts/roi_atlas_analysis.py
 useful_scripts/run_check_identity_collapse.sh
 
+# Generated / experimental outputs, not source
+motion_denoising_measure/connectivity/results/
+motion_denoising_measure/experimental_nbs/brain_mask.nii.gz
+motion_denoising_measure/experimental_nbs/dvars_tsnr_notebook.ipynb
+motion_denoising_measure/experimental_nbs/results_images/
+motion_denoising_measure/experimental_nbs/QCFC_significant_edges_before_denoising.svg
+motion_denoising_measure/experimental_nbs/qc-fc_significant_eddges_plot.ipynb
+

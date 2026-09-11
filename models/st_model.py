@@ -132,7 +132,6 @@ class STArtefactEncoder(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 # Decoders
 # ─────────────────────────────────────────────────────────────────────────────
-
 class STMotionFreeDecoder(nn.Module):
     """
     Spatiotemporal motion-free decoder (G_B).
@@ -174,7 +173,6 @@ class STMotionFreeDecoder(nn.Module):
         x = x.reshape(B * T, C, D, H, W)
         x = self.out_conv(x)                        # (B*T, 1, D, H, W)
         return x.squeeze(1).reshape(B, T, D, H, W)
-
 
 class STMotionCorruptedDecoder(nn.Module):
     """
@@ -253,7 +251,6 @@ class STMotionCorruptedDecoder(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 # Discriminator
 # ─────────────────────────────────────────────────────────────────────────────
-
 class _STScaleCNN(nn.Module):
     """Single-scale factorized PatchGAN CNN.
 
@@ -328,10 +325,6 @@ class STMultiScaleDiscriminator(nn.Module):
                 x_in = x_sp.reshape(B, T, 1, D, H, W)
         return outputs
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Full model
-# ─────────────────────────────────────────────────────────────────────────────
 
 class SpatioTemporalCycleGAN(nn.Module):
     """
@@ -488,6 +481,7 @@ class SpatioTemporalCycleGAN(nn.Module):
         if self.residual:
             out = self._masked_residual(x_a, out)
         return out
+    
 
     def count_parameters(self) -> dict:
         def n(m): return sum(p.numel() for p in m.parameters())

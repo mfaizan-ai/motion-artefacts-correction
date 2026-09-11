@@ -18,7 +18,6 @@ Based on:
     V-Net   (Milletari et al.2016) — 3D strided conv design
     Dr-CycleGAN (Dewey et al. 2020) — medical image disentanglement
 """
-
 import torch
 import torch.nn as nn
 from models.building_blocks import ResBlock3D, StridedConvBlock
@@ -282,7 +281,6 @@ class ArtefactEncoder(nn.Module):
             ),
             nn.LeakyReLU(negative_slope, inplace=inplace),
         )
-
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Parameters
