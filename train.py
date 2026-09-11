@@ -50,66 +50,120 @@ from grade_dataset import (FMRIUnpairedGradeDataset, worker_init_fn,  # grade_da
 
 
 # fMRI quality metrics
-def compute_dvars(x: torch.Tensor) -> float:
-    """
-    DVARS — RMS of the temporal derivative of the global signal.
-    For each timepoint t > 0:
-        dvars(t) = sqrt( mean( (x[:,t,...] - x[:,t-1,...])^2 ) )
-    Returns the mean DVARS across all timepoints and batch items.
+def _expand_mask(mask: torch.Tensor, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """mask: (X,Y,Z) or (B,X,Y,Z) bool -> (B,X,Y,Z) bool, plus its per-batch
+    voxel count (B,). Shared by compute_dvars/compute_tsnr/compute_global_signal_std
+    so all three restrict to the same brain voxels instead of the whole FOV."""
+    mask = torch.as_tensor(mask, device=x.device, dtype=torch.bool)
+    if mask.ndim == 3:
+        mask = mask.unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+    elif mask.ndim != 4:
+        raise ValueError("mask must have shape (X,Y,Z) or (B,X,Y,Z)")
+    if mask.shape != (x.shape[0], *x.shape[-3:]):
+        raise ValueError(f"Mask shape {tuple(mask.shape)} incompatible with {tuple(x.shape)}")
+    voxel_count = mask.sum(dim=(-3, -2, -1))
+    if torch.any(voxel_count == 0):
+        raise ValueError("Each brain mask must contain at least one voxel.")
+    return mask, voxel_count
 
-    Lower = less frame-to-frame signal change = fewer motion spikes.
+
+def compute_dvars(
+    x: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    return_per_frame: bool = False,
+):
+    """
+    DVARS — RMS of the temporal derivative of the global signal, restricted
+    to brain-mask voxels. Background stays exactly 0 at every timepoint
+    (via _masked_residual), so including it in the mean would dilute the
+    result by the background:brain voxel ratio -- matches nipype's DVARS
+    convention, which is always mask-restricted, not computed over the whole FOV.
+
+    For each timepoint t > 0:
+        dvars(t) = sqrt( mean_{v in mask}( (x[:,t,v] - x[:,t-1,v])^2 ) )
 
     Args:
-        x : (B, T, X, Y, Z)  PSC-normalised chunk, on CPU
+        x    : (B, T, X, Y, Z)  PSC-normalised chunk
+        mask : (X,Y,Z) or (B,X,Y,Z) boolean brain mask. If None, falls back
+               to the old unmasked (whole-FOV) behaviour.
+        return_per_frame : also return per-(batch,frame) DVARS, shape (B, T-1)
+
     Returns:
-        float  mean DVARS
+        float mean DVARS, or (float, Tensor) if return_per_frame
     """
-    # Difference between consecutive timepoints: (B, T-1, X, Y, Z)
-    diff = x[:, 1:, ...] - x[:, :-1, ...]
-    # RMS over spatial dims for each frame: (B, T-1)
-    dvars_per_frame = diff.pow(2).mean(dim=(-3, -2, -1)).sqrt()
-    return dvars_per_frame.mean().item()
+    if x.ndim != 5:
+        raise ValueError(f"x must have shape (B,T,X,Y,Z), got {tuple(x.shape)}")
+    if x.shape[1] < 2:
+        raise ValueError("At least two timepoints are required.")
+
+    x = x.float()
+    diff_squared = (x[:, 1:] - x[:, :-1]).square()  # (B, T-1, X, Y, Z)
+
+    if mask is None:
+        mean_sq = diff_squared.mean(dim=(-3, -2, -1))
+    else:
+        mask, voxel_count = _expand_mask(mask, x)
+        mask_float = mask.to(diff_squared.dtype)
+        mean_sq = (
+            (diff_squared * mask_float[:, None]).sum(dim=(-3, -2, -1)) / voxel_count[:, None]
+        )
+
+    dvars_per_frame = mean_sq.sqrt()
+    mean_dvars = dvars_per_frame.mean().item()
+    if return_per_frame:
+        return mean_dvars, dvars_per_frame
+    return mean_dvars
 
 
-def compute_tsnr(x: torch.Tensor) -> float:
+def compute_tsnr(x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> float:
     """
     Temporal SNR — mean signal divided by temporal std, averaged over brain.
 
     tSNR(voxel) = mean(x, dim=T) / std(x, dim=T)
-    Returns mean tSNR over all brain voxels (non-zero mean) and batch items.
-
     Higher = cleaner signal relative to noise.
 
     Args:
-        x : (B, T, X, Y, Z)  PSC-normalised chunk, on CPU
+        x    : (B, T, X, Y, Z)  PSC-normalised chunk, on CPU
+        mask : (X,Y,Z) or (B,X,Y,Z) boolean brain mask. If None, falls back
+               to the old behaviour of deriving "brain" from this tensor's
+               own nonzero mean (fine for real input, but a corrected/
+               reconstructed tensor has no guarantee its background stays
+               exactly 0 -- pass the mask derived from the real input instead).
     Returns:
         float  mean tSNR
     """
     mean = x.mean(dim=1)                        # (B, X, Y, Z)
     std  = x.std(dim=1)                         # (B, X, Y, Z)
     valid = std > 1e-3                          # exclude constant voxels (PSC-zeroed boundaries)
+    if mask is not None:
+        brain_mask, _ = _expand_mask(mask, x)
+        valid = valid & brain_mask
     if valid.sum() == 0:
         return 0.0
     tsnr = mean[valid].abs() / std[valid]
     return tsnr.mean().item()
 
 
-def compute_global_signal_std(x: torch.Tensor) -> float:
+def compute_global_signal_std(x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> float:
     """
     Global signal stability — std of the mean brain signal over time.
 
-    Global signal(t) = mean over all brain voxels at timepoint t.
-    Returns std of that timeseries, averaged over the batch.
-
+    Global signal(t) = mean over brain-mask voxels at timepoint t.
     Lower = more stable global signal = less motion-driven fluctuation.
 
     Args:
-        x : (B, T, X, Y, Z)  PSC-normalised chunk, on CPU
+        x    : (B, T, X, Y, Z)  PSC-normalised chunk, on CPU
+        mask : (X,Y,Z) or (B,X,Y,Z) boolean brain mask. If None, falls back
+               to the old unmasked (whole-FOV) behaviour.
     Returns:
         float  mean global signal std
     """
-    # Mean over spatial dims at each timepoint: (B, T)
-    gs = x.mean(dim=(-3, -2, -1))
+    if mask is None:
+        gs = x.mean(dim=(-3, -2, -1))
+    else:
+        mask, voxel_count = _expand_mask(mask, x)
+        mask_float = mask.to(x.dtype)
+        gs = (x * mask_float[:, None]).sum(dim=(-3, -2, -1)) / voxel_count[:, None]
     return gs.std(dim=1).mean().item()
 
 
@@ -174,14 +228,20 @@ def compute_fmri_metrics(
     xi = x_input.detach().cpu()
     xc = x_corrected.detach().cpu()
 
-    dvars_in  = compute_dvars(xi)
-    dvars_out = compute_dvars(xc)
+    # Ground-truth brain mask from the real input, NOT the corrected output --
+    # an imperfect correction has no guarantee its background stays exactly 0,
+    # so deriving the mask from x_corrected would treat model noise as tissue.
+    # Background doesn't move over time, so the first timepoint is enough.
+    mask = xi[:, 0] != 0  # (B, X, Y, Z)
 
-    tsnr_in   = compute_tsnr(xi)
-    tsnr_out  = compute_tsnr(xc)
+    dvars_in  = compute_dvars(xi, mask=mask)
+    dvars_out = compute_dvars(xc, mask=mask)
 
-    gs_in     = compute_global_signal_std(xi)
-    gs_out    = compute_global_signal_std(xc)
+    tsnr_in   = compute_tsnr(xi, mask=mask)
+    tsnr_out  = compute_tsnr(xc, mask=mask)
+
+    gs_in     = compute_global_signal_std(xi, mask=mask)
+    gs_out    = compute_global_signal_std(xc, mask=mask)
 
     sm_in     = compute_spatial_smoothness(xi)
     sm_out    = compute_spatial_smoothness(xc)
@@ -752,7 +812,6 @@ def train_one_epoch(
         result["D_roi_total"] = acc["D_roi_total"] / n_roi_updates
     return result
 
-
 # Validation epoch
 @torch.no_grad()
 def validate(
@@ -1163,7 +1222,6 @@ def main() -> None:
 
     is_main = (rank == 0)
     # ─────────────────────────────────────────────────────────────────────────
-
     set_seed(args.seed + rank, deterministic=args.deterministic)  # different seed per rank to diversify augmentation
 
     # Run directory
@@ -1239,6 +1297,7 @@ def main() -> None:
                 "--manifest_csv and --chunk_metadata_csv required "
                 "with --use_sequences"
             )
+            
         if is_main:
             print(f"  Sequence mode enabled")
             print(f"  Manifest       : {args.manifest_csv}")
@@ -1258,6 +1317,7 @@ def main() -> None:
             split="val", chunk_metadata_csv=args.grade_chunk_metadata_csv,
             run_stats_csv=args.grade_run_stats_csv, full_coverage=True,
         )
+        
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
         loaders = {
             "train": DataLoader(
