@@ -18,7 +18,8 @@ all_dataset/
 slurm/
 old_slurm/
 archives/
-
+docs/
+documentations/
 
 baseline/
 .vscode
