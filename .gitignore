@@ -16,6 +16,9 @@ ROI_analysis/
 tc_only_v2/
 all_dataset/
 slurm/
+old_slurm/
+archives/
+
 
 baseline/
 .vscode
