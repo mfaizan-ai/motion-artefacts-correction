@@ -20,6 +20,7 @@ old_slurm/
 archives/
 docs/
 documentations/
+motion_denoising_pipeline_level_evaluation/
 
 baseline/
 .vscode
