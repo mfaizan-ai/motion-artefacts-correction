@@ -37,6 +37,14 @@ from statsmodels.stats.multitest import multipletests
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from losses import _pearson_corr_matrix
 
+# All evaluation runs (raw baseline, each corrected pipeline, ...) land here,
+# one uniquely-named subfolder per pipeline -- so results never get scattered
+# across the dataset root or silently overwritten by the next run.
+PIPELINE_EVAL_ROOT = (
+    "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
+    "faizan_motion_correction_dataset/motion_denoising_pipeline_level_evaluation"
+)
+
 @dataclass
 class EvalConfig:
     chunk_metadata_csv: str
@@ -284,6 +292,7 @@ def run_evaluation(config: EvalConfig) -> dict:
     print(f"tSNR (nipype convention): mean={tsnr_values.mean():.4f}, sd={tsnr_values.std(ddof=1):.4f}")
 
     os.makedirs(config.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(config.output_dir, "figures"), exist_ok=True)
     r_mat = np.full((n_rois, n_rois), np.nan)
     p_mat = np.full((n_rois, n_rois), np.nan)
     fdr_mat = np.zeros((n_rois, n_rois), dtype=bool)
@@ -345,6 +354,9 @@ def run_evaluation(config: EvalConfig) -> dict:
 
 def make_plots(config: EvalConfig, r_mat, fdr_mat, dist_edges, qcfc_r, q_values, fd,
                dvars_values, tsnr_values) -> None:
+    fig_dir = os.path.join(config.output_dir, "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+
     fig, ax = plt.subplots(figsize=(7, 6))
     im = ax.imshow(r_mat, cmap="RdBu_r", vmin=-1, vmax=1)
     ax.set_title("QC-FC matrix")
@@ -352,7 +364,7 @@ def make_plots(config: EvalConfig, r_mat, fdr_mat, dist_edges, qcfc_r, q_values,
     ax.set_ylabel("ROI")
     fig.colorbar(im, ax=ax, label="QC-FC (r)")
     fig.tight_layout()
-    fig.savefig(os.path.join(config.output_dir, "qc_fc_matrix.png"), dpi=150)
+    fig.savefig(os.path.join(fig_dir, "qc_fc_matrix.png"), dpi=150)
     plt.close(fig)
 
     smoothed = lowess(qcfc_r, dist_edges, frac=0.3)
@@ -364,7 +376,7 @@ def make_plots(config: EvalConfig, r_mat, fdr_mat, dist_edges, qcfc_r, q_values,
     ax.set_ylabel("QC-FC (r)")
     ax.set_title("QC-FC distance dependence")
     fig.tight_layout()
-    fig.savefig(os.path.join(config.output_dir, "qc_fc_distance_dependence.png"), dpi=150)
+    fig.savefig(os.path.join(fig_dir, "qc_fc_distance_dependence.png"), dpi=150)
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(5, 6))
@@ -375,7 +387,7 @@ def make_plots(config: EvalConfig, r_mat, fdr_mat, dist_edges, qcfc_r, q_values,
     ax.spines[["top", "right"]].set_visible(False)
     ax.set_title("Modularity Q")
     fig.tight_layout()
-    fig.savefig(os.path.join(config.output_dir, "modularity_q_violin.png"), dpi=150, bbox_inches="tight")
+    fig.savefig(os.path.join(fig_dir, "modularity_q_violin.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -387,7 +399,7 @@ def make_plots(config: EvalConfig, r_mat, fdr_mat, dist_edges, qcfc_r, q_values,
     ax.set_ylabel("Modularity Q")
     ax.set_title("Modularity Q vs mean FD")
     fig.tight_layout()
-    fig.savefig(os.path.join(config.output_dir, "modularity_q_vs_fd.png"), dpi=150)
+    fig.savefig(os.path.join(fig_dir, "modularity_q_vs_fd.png"), dpi=150)
     plt.close(fig)
 
     sim_df = pd.DataFrame({"Mean_DVARS": dvars_values, "Mean_tSNR": tsnr_values})
@@ -410,7 +422,7 @@ def make_plots(config: EvalConfig, r_mat, fdr_mat, dist_edges, qcfc_r, q_values,
         ax.spines[["top", "right"]].set_visible(False)
     plt.suptitle(f"DVARS and tSNR (nipype convention, n={len(sim_df)} subjects)", y=1.02)
     fig.tight_layout()
-    fig.savefig(os.path.join(config.output_dir, "dvars_tsnr_violin.png"), dpi=150, bbox_inches="tight")
+    fig.savefig(os.path.join(fig_dir, "dvars_tsnr_violin.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     if not fdr_mat.any():
@@ -445,7 +457,7 @@ def make_plots(config: EvalConfig, r_mat, fdr_mat, dist_edges, qcfc_r, q_values,
             colorbar=True,
             figure=fig,
         )
-        fig.savefig(os.path.join(config.output_dir, "connectome.png"), dpi=150, bbox_inches="tight")
+        fig.savefig(os.path.join(fig_dir, "connectome.png"), dpi=150, bbox_inches="tight")
         plt.close(fig)
 
     print(f"saved plots -> {config.output_dir}")
@@ -484,9 +496,10 @@ def parse_args() -> EvalConfig:
         ),
     )
     parser.add_argument(
-        "--output_dir", default=(
-            "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
-            "faizan_motion_correction_dataset/roi_timeseries_hfiltered_videos/denoising_eval_2mo_firstrun"
+        "--pipeline_name", default="raw_data_each_sub_first_run",
+        help=(
+            "Unique subfolder name for this pipeline's results, always created under "
+            f"{PIPELINE_EVAL_ROOT} (e.g. 'raw_data_each_sub_first_run', 'st_v4_corrected_each_sub_first_run')."
         ),
     )
     parser.add_argument("--edge_alpha", type=float, default=0.05)
@@ -510,7 +523,9 @@ def parse_args() -> EvalConfig:
         print("DEBUG mode: max_subjects=4, repeats=5")
     del args.debug
 
-    return EvalConfig(**vars(args))
+    kwargs = vars(args)
+    kwargs["output_dir"] = os.path.join(PIPELINE_EVAL_ROOT, kwargs.pop("pipeline_name"))
+    return EvalConfig(**kwargs)
 
 
 if __name__ == "__main__":
