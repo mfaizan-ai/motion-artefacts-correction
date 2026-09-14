@@ -1,14 +1,6 @@
 """
 denoising_evaluation.py
 =========================
-Consolidated denoising-quality evaluation across subjects: QC-FC (with FDR
-and median |QC-FC|), QC-FC distance-dependence, network modularity Q
-(correlated with mean FD), and nipype-convention DVARS/tSNR. One pass over
-subjects computes all of these and writes the results (manifest.csv,
-qc_fc_*.npy, distance_matrix.npy, summary.txt) to output_dir.
-
-This script only computes and saves data -- see plot_denoising_qc.py for
-generating figures from these saved results.
 """
 import argparse
 import os
@@ -16,7 +8,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import nibabel as nib
 import numpy as np
@@ -25,6 +17,7 @@ import torch
 from netneurotools.modularity import consensus_modularity
 from nilearn import plotting
 from scipy import stats
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from statsmodels.stats.multitest import multipletests
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -54,6 +47,11 @@ class EvalConfig:
     # evaluate a corrected pipeline's DVARS/tSNR/global-signal-std instead of
     # the raw volumes -- source_root stays pointed at the RAW tree either way.
     corrected_root: Optional[str] = None
+    # Set (alongside roi_timeseries_root, which stays pointed at the RAW ROI
+    # timeseries) to run the raw-vs-corrected modularity/community comparison
+    # instead of the standard single-pipeline evaluation -- see
+    # run_modularity_comparison().
+    corrected_roi_timeseries_root: Optional[str] = None
 
 def get_git_commit() -> str:
     try:
@@ -98,6 +96,13 @@ def select_first_runs(config: EvalConfig) -> pd.DataFrame:
 def roi_ts_path(source_volume_path: str, config: EvalConfig) -> str:
     rel_dir = os.path.relpath(os.path.dirname(source_volume_path), config.source_root)
     return os.path.join(config.roi_timeseries_root, rel_dir, "roi_timeseries.npy")
+
+def corrected_roi_ts_path(source_volume_path: str, config: EvalConfig) -> str:
+    """Same relative-dir convention as roi_ts_path, but under
+    config.corrected_roi_timeseries_root (a create_roi_timeseries.py
+    --corrected_root output)."""
+    rel_dir = os.path.relpath(os.path.dirname(source_volume_path), config.source_root)
+    return os.path.join(config.corrected_roi_timeseries_root, rel_dir, "roi_timeseries.npy")
 
 def mean_fd(fd_path: str) -> float:
     return pd.read_csv(fd_path)["FramewiseDisplacement"].mean()
@@ -145,6 +150,144 @@ def consensus_q_from_fc(fc: np.ndarray, config: EvalConfig) -> float:
         repeats=config.repeats, seed=config.seed,
     )
     return signed_asymmetric_q(fc, ci, gamma=config.gamma)
+
+
+def prepare_fc(fc: np.ndarray) -> np.ndarray:
+    """
+    Apply exactly the same matrix-level preparation to every FC matrix.
+    """
+    fc = np.asarray(fc, dtype=float).copy()
+
+    if fc.ndim != 2 or fc.shape[0] != fc.shape[1]:
+        raise ValueError(f"FC must be square, but received {fc.shape}.")
+
+    if not np.all(np.isfinite(fc)):
+        raise ValueError("FC contains NaN or infinite values.")
+
+    fc = (fc + fc.T) / 2.0
+    np.fill_diagonal(fc, 0.0)
+
+    return fc
+
+
+def consensus_metrics_from_fc(
+    fc: np.ndarray,
+    config: EvalConfig,
+) -> Dict[str, Any]:
+    """
+    Find consensus communities and calculate modularity information
+    for one FC matrix.
+
+    Returns
+    -------
+    Dictionary containing:
+        q               : signed asymmetric modularity
+        n_communities   : number of detected communities
+        communities     : community label for every ROI
+    """
+    fc = prepare_fc(fc)
+
+    communities, _, _ = consensus_modularity(
+        adjacency=fc,
+        gamma=config.gamma,
+        B="negative_asym",
+        repeats=config.repeats,
+        seed=config.seed,
+    )
+
+    communities = np.asarray(communities).reshape(-1)
+
+    if len(communities) != fc.shape[0]:
+        raise ValueError(
+            "Number of community labels does not match the "
+            "number of ROIs."
+        )
+
+    q = signed_asymmetric_q(
+        W=fc,
+        communities=communities,
+        gamma=config.gamma,
+    )
+
+    return {
+        "q": float(q),
+        "n_communities": int(np.unique(communities).size),
+        "communities": communities,
+    }
+
+
+def compare_raw_corrected_modularity(
+    raw_fc: np.ndarray,
+    corrected_fc: np.ndarray,
+    config: EvalConfig,
+) -> Dict[str, Any]:
+    """
+    Compare consensus modularity and community assignments between
+    matched raw and corrected FC matrices from one subject/run.
+    """
+    raw_fc = prepare_fc(raw_fc)
+    corrected_fc = prepare_fc(corrected_fc)
+
+    if raw_fc.shape != corrected_fc.shape:
+        raise ValueError(
+            "Raw and corrected FC matrices must have identical shapes. "
+            f"Received {raw_fc.shape} and {corrected_fc.shape}."
+        )
+
+    # Both use the same gamma, repetitions, signed modularity type and seed.
+    raw = consensus_metrics_from_fc(raw_fc, config)
+    corrected = consensus_metrics_from_fc(corrected_fc, config)
+
+    ci_raw = raw["communities"]
+    ci_corrected = corrected["communities"]
+
+    # Label-invariant community similarity
+    ari = adjusted_rand_score(ci_raw, ci_corrected)
+
+    nmi = normalized_mutual_info_score(
+        ci_raw,
+        ci_corrected,
+        average_method="arithmetic",
+    )
+
+    # Cross-partition Q values
+    q_corrected_raw_partition = signed_asymmetric_q(
+        corrected_fc,
+        ci_raw,
+        gamma=config.gamma,
+    )
+
+    q_raw_corrected_partition = signed_asymmetric_q(
+        raw_fc,
+        ci_corrected,
+        gamma=config.gamma,
+    )
+
+    return {
+        "q_raw": raw["q"],
+        "q_corrected": corrected["q"],
+        "delta_q": corrected["q"] - raw["q"],
+
+        "n_communities_raw": raw["n_communities"],
+        "n_communities_corrected": corrected["n_communities"],
+
+        "community_ari": float(ari),
+        "community_nmi": float(nmi),
+
+        # Corrected FC evaluated using raw-data communities
+        "q_corrected_using_raw_partition": float(
+            q_corrected_raw_partition
+        ),
+
+        # Raw FC evaluated using corrected-data communities
+        "q_raw_using_corrected_partition": float(
+            q_raw_corrected_partition
+        ),
+
+        # Keep labels if you want to plot them later
+        "communities_raw": ci_raw,
+        "communities_corrected": ci_corrected,
+    }
 
 
 def build_distance_matrix(atlas_path: str) -> np.ndarray:
@@ -484,6 +627,81 @@ def run_evaluation(config: EvalConfig) -> dict:
         "fd_dvars_spearman_rho": fd_dvars_spearman_rho, "fd_dvars_spearman_p": fd_dvars_spearman_p,
     }
 
+
+def run_modularity_comparison(config: EvalConfig) -> None:
+    """
+    Per-subject raw-vs-corrected community/modularity comparison: shows
+    whether motion correction preserves the brain's underlying functional
+    network structure (high community_ari/nmi, small |delta_q|) rather than
+    just collapsing or reshuffling it. Both conditions use the identical
+    gamma/repeats/seed (config), so the comparison is fair.
+    """
+    runs = select_first_runs(config)
+    if config.max_subjects is not None:
+        runs = runs.head(config.max_subjects)
+    n = len(runs)
+    print(f"{n} subjects")
+
+    rows, communities_raw_all, communities_corrected_all, subject_ids = [], [], [], []
+    for i, row in enumerate(runs.itertuples(index=False), 1):
+        raw_roi_ts = np.load(roi_ts_path(row.source_volume_path, config))
+        corrected_roi_ts = np.load(corrected_roi_ts_path(row.source_volume_path, config))
+
+        raw_fc = _pearson_corr_matrix(torch.from_numpy(raw_roi_ts).float()).numpy()
+        corrected_fc = _pearson_corr_matrix(torch.from_numpy(corrected_roi_ts).float()).numpy()
+
+        result = compare_raw_corrected_modularity(raw_fc, corrected_fc, config)
+
+        rows.append({"subject_id": row.subject_id, **{
+            k: v for k, v in result.items() if k not in ("communities_raw", "communities_corrected")
+        }})
+        communities_raw_all.append(result["communities_raw"])
+        communities_corrected_all.append(result["communities_corrected"])
+        subject_ids.append(row.subject_id)
+
+        if i % 16 == 0 or i == n:
+            print(f"  [{i}/{n}] {row.subject_id}: q_raw={result['q_raw']:.4f} "
+                  f"q_corrected={result['q_corrected']:.4f} ARI={result['community_ari']:.3f} "
+                  f"NMI={result['community_nmi']:.3f}")
+
+    df = pd.DataFrame(rows)
+
+    os.makedirs(config.output_dir, exist_ok=True)
+    df.to_csv(os.path.join(config.output_dir, "modularity_comparison.csv"), index=False)
+    np.savez(
+        os.path.join(config.output_dir, "modularity_comparison_communities.npz"),
+        subject_id=np.array(subject_ids),
+        communities_raw=np.stack(communities_raw_all),
+        communities_corrected=np.stack(communities_corrected_all),
+    )
+
+    summary = {
+        "q_raw_mean": df["q_raw"].mean(), "q_raw_sd": df["q_raw"].std(ddof=1),
+        "q_corrected_mean": df["q_corrected"].mean(), "q_corrected_sd": df["q_corrected"].std(ddof=1),
+        "delta_q_mean": df["delta_q"].mean(), "delta_q_sd": df["delta_q"].std(ddof=1),
+        "community_ari_mean": df["community_ari"].mean(), "community_ari_sd": df["community_ari"].std(ddof=1),
+        "community_nmi_mean": df["community_nmi"].mean(), "community_nmi_sd": df["community_nmi"].std(ddof=1),
+        "q_corrected_using_raw_partition_mean": df["q_corrected_using_raw_partition"].mean(),
+        "q_raw_using_corrected_partition_mean": df["q_raw_using_corrected_partition"].mean(),
+    }
+    print(f"Q: raw={summary['q_raw_mean']:.4f}+/-{summary['q_raw_sd']:.4f}, "
+          f"corrected={summary['q_corrected_mean']:.4f}+/-{summary['q_corrected_sd']:.4f}, "
+          f"delta_Q={summary['delta_q_mean']:.4f}+/-{summary['delta_q_sd']:.4f}")
+    print(f"Community similarity: ARI={summary['community_ari_mean']:.4f}+/-{summary['community_ari_sd']:.4f}, "
+          f"NMI={summary['community_nmi_mean']:.4f}+/-{summary['community_nmi_sd']:.4f}")
+    print(f"Cross-partition Q: corrected-FC-under-raw-partition="
+          f"{summary['q_corrected_using_raw_partition_mean']:.4f}, raw-FC-under-corrected-partition="
+          f"{summary['q_raw_using_corrected_partition_mean']:.4f}")
+
+    with open(os.path.join(config.output_dir, "modularity_comparison_summary.txt"), "w") as f:
+        f.write(f"n_subjects: {n}\n")
+        for key, value in summary.items():
+            f.write(f"{key}: {value:.4f}\n")
+    print(f"saved results -> {config.output_dir}")
+
+    append_run_log(config, n, {f"modularity_comparison_{k}": v for k, v in summary.items()})
+
+
 def parse_args() -> EvalConfig:
     parser = argparse.ArgumentParser(description="Denoising evaluation: QC-FC, QC-FC-DD, network modularity")
     parser.add_argument(
@@ -514,6 +732,14 @@ def parse_args() -> EvalConfig:
         # e.g. .../motion_corrected_st_v4 -- a denoise_runs.py output_root.
         "--corrected_root", default=None,
         help="Set to evaluate DVARS/tSNR/global-signal-std on a corrected pipeline instead of raw",
+    )
+    parser.add_argument(
+        # e.g. .../roi_timeseries_st_v4_corrected -- a create_roi_timeseries.py
+        # --corrected_root output. Setting this switches the script to
+        # run_modularity_comparison() (raw-vs-corrected community structure)
+        # instead of the standard single-pipeline evaluation.
+        "--corrected_roi_timeseries_root", default=None,
+        help="Set to run the raw-vs-corrected modularity/community comparison instead of standard evaluation",
     )
     parser.add_argument(
         "--atlas_path", default=(
@@ -553,4 +779,8 @@ def parse_args() -> EvalConfig:
 
 
 if __name__ == "__main__":
-    run_evaluation(parse_args())
+    config = parse_args()
+    if config.corrected_roi_timeseries_root:
+        run_modularity_comparison(config)
+    else:
+        run_evaluation(config)
