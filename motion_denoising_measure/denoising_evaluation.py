@@ -106,6 +106,11 @@ def mean_fd(fd_path: str) -> float:
 def fisher_z(r: np.ndarray) -> np.ndarray:
     return np.arctanh(np.clip(r, -1 + 1e-7, 1 - 1e-7))
 
+def fisher_mean(r: np.ndarray) -> float:
+    """Mean correlation via the Fisher-z transform, NaN-safe (a constant-
+    variance run's undefined correlation is skipped, not propagated)."""
+    return float(np.tanh(np.nanmean(fisher_z(r))))
+
 def signed_asymmetric_q(W, communities, gamma=1.0):
     W = np.asarray(W, dtype=float).copy()
     ci = np.asarray(communities).reshape(-1)
@@ -167,15 +172,15 @@ def corrected_volume_path(source_volume_path: str, source_root: str, corrected_r
     return os.path.join(corrected_root, rel_dir, fname)
 
 
-def nipype_dvars(
+def nipype_dvars_timeseries(
     func: np.ndarray,
     mask: np.ndarray,
     remove_zerovariance: bool = True,
     intensity_normalization: float = 1000.0,
     variance_tol: float = 1e-7,
-) -> float:
+) -> np.ndarray:
     """
-    Mean non-standardized DVARS (Power et al. 2012), nipype's exact formula
+    Per-frame non-standardized DVARS (T-1 values), nipype's exact formula
     (nipype.algorithms.confounds.compute_dvars) reimplemented on in-memory
     arrays instead of file paths -- verified to match nipype's own function
     to floating-point precision on real data.
@@ -195,8 +200,93 @@ def nipype_dvars(
         mfunc = mfunc[keep, :]
 
     func_diff = np.diff(mfunc, axis=1)
-    dvars_nstd = np.sqrt(np.square(func_diff).mean(axis=0))
-    return float(dvars_nstd.mean())
+    return np.sqrt(np.square(func_diff).mean(axis=0))
+
+
+def nipype_dvars(func: np.ndarray, mask: np.ndarray, **kwargs) -> float:
+    """Mean non-standardized DVARS -- see nipype_dvars_timeseries."""
+    return float(nipype_dvars_timeseries(func, mask, **kwargs).mean())
+
+
+def compute_fd_dvars_correlation(fd, dvars):
+    """
+    Calculate the within-run correlation between FD and DVARS.
+
+    Parameters
+    ----------
+    fd : array-like
+        Framewise-displacement time series.
+
+        It may contain:
+        - T values, where the first value is usually zero, or
+        - T-1 values already aligned with DVARS.
+
+    dvars : array-like
+        DVARS time series, normally containing T-1 values.
+
+    Returns
+    -------
+    dict
+        Pearson and Spearman correlations, p-values and the
+        number of valid frame transitions.
+    """
+
+    fd = np.asarray(fd, dtype=float).squeeze()
+    dvars = np.asarray(dvars, dtype=float).squeeze()
+
+    if fd.ndim != 1 or dvars.ndim != 1:
+        raise ValueError("FD and DVARS must be one-dimensional arrays.")
+
+    # DVARS contains T-1 differences.
+    # If FD contains T values, discard its first undefined/zero value.
+    if len(fd) == len(dvars) + 1:
+        fd = fd[1:]
+
+    if len(fd) != len(dvars):
+        raise ValueError(
+            f"FD and DVARS are not aligned: "
+            f"FD has {len(fd)} values and "
+            f"DVARS has {len(dvars)} values."
+        )
+
+    # Remove pairs where either value is missing or infinite
+    valid = np.isfinite(fd) & np.isfinite(dvars)
+
+    fd_valid = fd[valid]
+    dvars_valid = dvars[valid]
+
+    if len(fd_valid) < 3:
+        raise ValueError(
+            "At least three valid FD-DVARS pairs are required."
+        )
+
+    # Correlation is undefined if either series is constant
+    if np.std(fd_valid) == 0 or np.std(dvars_valid) == 0:
+        return {
+            "pearson_r": np.nan,
+            "pearson_p": np.nan,
+            "spearman_rho": np.nan,
+            "spearman_p": np.nan,
+            "n_transitions": len(fd_valid)
+        }
+
+    pearson_r, pearson_p = stats.pearsonr(
+        fd_valid,
+        dvars_valid
+    )
+
+    spearman_rho, spearman_p = stats.spearmanr(
+        fd_valid,
+        dvars_valid
+    )
+
+    return {
+        "pearson_r": pearson_r,
+        "pearson_p": pearson_p,
+        "spearman_rho": spearman_rho,
+        "spearman_p": spearman_p,
+        "n_transitions": len(fd_valid)
+    }
 
 
 def nipype_tsnr(func: np.ndarray, mask: np.ndarray) -> float:
@@ -230,6 +320,8 @@ def run_evaluation(config: EvalConfig) -> dict:
 
     n_rois, edge_rows, fds, q_values, subject_ids = None, [], [], [], []
     dvars_values, tsnr_values, gs_std_values = [], [], []
+    fd_dvars_pearson_r, fd_dvars_pearson_p = [], []
+    fd_dvars_spearman_rho, fd_dvars_spearman_p, fd_dvars_n = [], [], []
     for row in runs.itertuples(index=False):
         roi_ts = np.load(roi_ts_path(row.source_volume_path, config))
         fc = _pearson_corr_matrix(torch.from_numpy(roi_ts).float()).numpy()
@@ -249,9 +341,18 @@ def run_evaluation(config: EvalConfig) -> dict:
         if config.corrected_root:
             volume_path = corrected_volume_path(volume_path, config.source_root, config.corrected_root)
         func, mask = load_run_volume_and_mask(volume_path)
-        dvars_values.append(nipype_dvars(func, mask))
+        dvars_ts = nipype_dvars_timeseries(func, mask)
+        dvars_values.append(float(dvars_ts.mean()))
         tsnr_values.append(nipype_tsnr(func, mask))
         gs_std_values.append(global_signal_std(func, mask))
+
+        fd_ts = pd.read_csv(row.fd_path)["FramewiseDisplacement"].to_numpy()
+        fd_dvars = compute_fd_dvars_correlation(fd_ts, dvars_ts)
+        fd_dvars_pearson_r.append(fd_dvars["pearson_r"])
+        fd_dvars_pearson_p.append(fd_dvars["pearson_p"])
+        fd_dvars_spearman_rho.append(fd_dvars["spearman_rho"])
+        fd_dvars_spearman_p.append(fd_dvars["spearman_p"])
+        fd_dvars_n.append(fd_dvars["n_transitions"])
 
     edges = np.stack(edge_rows)
     fd = np.array(fds)
@@ -259,6 +360,11 @@ def run_evaluation(config: EvalConfig) -> dict:
     dvars_values = np.array(dvars_values)
     tsnr_values = np.array(tsnr_values)
     gs_std_values = np.array(gs_std_values)
+    fd_dvars_pearson_r = np.array(fd_dvars_pearson_r)
+    fd_dvars_pearson_p = np.array(fd_dvars_pearson_p)
+    fd_dvars_spearman_rho = np.array(fd_dvars_spearman_rho)
+    fd_dvars_spearman_p = np.array(fd_dvars_spearman_p)
+    fd_dvars_n = np.array(fd_dvars_n)
 
     if n < 3:
         raise ValueError("At least 3 independent subjects are required")
@@ -303,6 +409,8 @@ def run_evaluation(config: EvalConfig) -> dict:
     print(f"DVARS (nipype convention): mean={dvars_values.mean():.4f}, sd={dvars_values.std(ddof=1):.4f}")
     print(f"tSNR (nipype convention): mean={tsnr_values.mean():.4f}, sd={tsnr_values.std(ddof=1):.4f}")
     print(f"Global signal std: mean={gs_std_values.mean():.4f}, sd={gs_std_values.std(ddof=1):.4f}")
+    print(f"FD-DVARS within-run Pearson r: median={np.nanmedian(fd_dvars_pearson_r):.4f}, "
+          f"Fisher-z mean={fisher_mean(fd_dvars_pearson_r):.4f}")
 
     os.makedirs(config.output_dir, exist_ok=True)
     r_mat = np.full((n_rois, n_rois), np.nan)
@@ -322,6 +430,9 @@ def run_evaluation(config: EvalConfig) -> dict:
     pd.DataFrame({
         "subject_id": subject_ids, "mean_fd": fd, "Q": q_values,
         "dvars": dvars_values, "tsnr": tsnr_values, "gs_std": gs_std_values,
+        "fd_dvars_r": fd_dvars_pearson_r, "fd_dvars_p": fd_dvars_pearson_p,
+        "fd_dvars_spearman_rho": fd_dvars_spearman_rho, "fd_dvars_spearman_p": fd_dvars_spearman_p,
+        "fd_dvars_n_transitions": fd_dvars_n,
     }).to_csv(os.path.join(config.output_dir, "manifest.csv"), index=False)
     with open(os.path.join(config.output_dir, "summary.txt"), "w") as f:
         f.write(f"n_subjects: {n}\n")
@@ -339,6 +450,9 @@ def run_evaluation(config: EvalConfig) -> dict:
         f.write(f"tsnr_sd: {tsnr_values.std(ddof=1):.4f}\n")
         f.write(f"gs_std_mean: {gs_std_values.mean():.4f}\n")
         f.write(f"gs_std_sd: {gs_std_values.std(ddof=1):.4f}\n")
+        f.write(f"fd_dvars_pearson_r_median: {np.nanmedian(fd_dvars_pearson_r):.4f}\n")
+        f.write(f"fd_dvars_pearson_r_fisher_mean: {fisher_mean(fd_dvars_pearson_r):.4f}\n")
+        f.write(f"fd_dvars_spearman_rho_median: {np.nanmedian(fd_dvars_spearman_rho):.4f}\n")
     print(f"saved results -> {config.output_dir}")
     append_run_log(config, n, {
         "fdr_significant_edges": int(fdr_significant.sum()),
@@ -356,6 +470,9 @@ def run_evaluation(config: EvalConfig) -> dict:
         "tsnr_sd": tsnr_values.std(ddof=1),
         "gs_std_mean": gs_std_values.mean(),
         "gs_std_sd": gs_std_values.std(ddof=1),
+        "fd_dvars_pearson_r_median": np.nanmedian(fd_dvars_pearson_r),
+        "fd_dvars_pearson_r_fisher_mean": fisher_mean(fd_dvars_pearson_r),
+        "fd_dvars_spearman_rho_median": np.nanmedian(fd_dvars_spearman_rho),
     })
 
     return {
@@ -363,6 +480,8 @@ def run_evaluation(config: EvalConfig) -> dict:
         "dd_r": dd_r, "dd_p": dd_p, "Q": q_values, "mean_fd": fd,
         "q_fd_r": q_fd_r, "q_fd_p": q_fd_p,
         "dvars": dvars_values, "tsnr": tsnr_values, "gs_std": gs_std_values,
+        "fd_dvars_r": fd_dvars_pearson_r, "fd_dvars_p": fd_dvars_pearson_p,
+        "fd_dvars_spearman_rho": fd_dvars_spearman_rho, "fd_dvars_spearman_p": fd_dvars_spearman_p,
     }
 
 def parse_args() -> EvalConfig:

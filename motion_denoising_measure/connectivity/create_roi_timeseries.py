@@ -3,16 +3,7 @@ create_roi_timeseries.py
 =========================
 Extract Schaefer-400 ROI timeseries for every video-state run (2mo + 9mo) listed
 in a chunk-metadata CSV, apply a cosine high-pass filter (nilearn.signal.clean),
-and save mirroring each run's source directory structure under output_root.
-
-Note: if the source volumes are already voxel-level high-pass filtered (as
-motion_grades_chunk_5_dataset_hfiltered's are), the extra cosine filter on the
-ROI timeseries is close to a no-op (checked: cosine regressors explain ~0
-variance, R^2 ~1e-6, on a real hfiltered run). Kept because it's cheap and
-matters more on non-hfiltered source data.
-
-Config is a plain dataclass (ROITimeseriesConfig) so this is reusable from
-other scripts/notebooks without going through argparse.
+and save mirroring each run's source directory structure under output_root. 
 """
 import argparse
 import os

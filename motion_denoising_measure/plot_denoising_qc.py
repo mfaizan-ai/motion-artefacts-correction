@@ -18,7 +18,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from matplotlib.colors import Normalize
+from matplotlib.colors import Normalize, to_rgb
+from matplotlib.patches import Patch
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from nilearn import plotting
 from scipy import stats
@@ -27,6 +28,33 @@ DEFAULT_CONNECTOME_ATLAS_PATH = (
     "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
     "templates/rois/Schaefer2018_400Parcels_7Networks_order_FSLMNI152_2mm.nii.gz"
 )
+
+# ROI order in qc_fc_r.npy/distance_matrix.npy follows this atlas's label order
+# (1..400) -- this CSV lists the same 400 ROIs, in label order, with names
+# encoding hemisphere + Yeo-7 network (e.g. "7Networks_LH_Vis_1").
+DEFAULT_NETWORK_LABELS_CSV = (
+    "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
+    "templates/rois/Schaefer2018_400Parcels_7Networks_order_FSLMNI152_1mm.Centroid_RAS.csv"
+)
+
+# Standard Yeo-7 network colors (as used in the FreeSurfer/Schaefer LUTs).
+YEO7_NETWORK_COLORS = {
+    "Vis": "#781286",
+    "SomMot": "#4682B4",
+    "DorsAttn": "#00760E",
+    "SalVentAttn": "#C43AFA",
+    "Limbic": "#DCF8A4",
+    "Cont": "#E69422",
+    "Default": "#CB3F4A",
+}
+
+
+def load_network_labels(network_labels_csv: str) -> np.ndarray:
+    """400 "LH_Vis"-style hemisphere+network labels, in the same ROI-label
+    order as qc_fc_r.npy's rows/columns."""
+    names = pd.read_csv(network_labels_csv)["ROI Name"]
+    parts = names.str.split("_")
+    return (parts.str[1] + "_" + parts.str[2]).to_numpy()
 
 
 def load_results(result_dir: str) -> dict:
@@ -45,6 +73,7 @@ def load_results(result_dir: str) -> dict:
         "dvars_values": manifest["dvars"].to_numpy(),
         "tsnr_values": manifest["tsnr"].to_numpy(),
         "gs_std_values": manifest["gs_std"].to_numpy(),
+        "fd_dvars_values": manifest["fd_dvars_r"].to_numpy(),
     }
 
 
@@ -274,7 +303,6 @@ def plot_single_qcfc_distribution(
     # --------------------------------------------------------
     # KDE density calculation
     # --------------------------------------------------------
-
     x_grid = np.linspace(xlim[0], xlim[1], 500)
 
     kde = stats.gaussian_kde(
@@ -290,7 +318,6 @@ def plot_single_qcfc_distribution(
     # --------------------------------------------------------
     # Density plot
     # --------------------------------------------------------
-
     ax.fill_between(
         x_grid,
         0,
@@ -437,20 +464,370 @@ def plot_q_vs_fd(mean_fd, q_values):
     return fig
 
 
-def plot_qcfc_matrix(fig_dir, r_mat) -> None:
-    fig, ax = plt.subplots(figsize=(7, 6))
+def plot_subject_fd_dvars_correlations(
+    correlations,
+    method_name="Raw",
+    title="Within-run FD–DVARS correlations",
+    uses_gsr=False,
+    n_bootstrap=5000,
+    figsize=(8.5, 4.8)
+):
+    """
+    Plot one subject-level FD-DVARS correlation distribution
+    using a Ciric-style label strip and aligned plot panel.
+    """
+
+    r = np.asarray(correlations, dtype=float)
+    r = r[np.isfinite(r)]
+
+    if len(r) < 3:
+        raise ValueError(
+            "At least three valid correlations are required."
+        )
+
+    # Prevent infinite Fisher transformations
+    r = np.clip(r, -0.999999, 0.999999)
+
+    # --------------------------------------------------------
+    # Group statistics
+    # --------------------------------------------------------
+
+    fisher_z = np.arctanh(r)
+    group_r = np.tanh(np.mean(fisher_z))
+    median_r = np.median(r)
+
+    # Subject-level bootstrap CI
+    rng = np.random.default_rng(42)
+
+    bootstrap_indices = rng.integers(
+        low=0,
+        high=len(r),
+        size=(n_bootstrap, len(r))
+    )
+
+    bootstrap_mean_z = np.mean(
+        fisher_z[bootstrap_indices],
+        axis=1
+    )
+
+    bootstrap_mean_r = np.tanh(bootstrap_mean_z)
+
+    ci_low, ci_high = np.percentile(
+        bootstrap_mean_r,
+        [2.5, 97.5]
+    )
+
+    # --------------------------------------------------------
+    # Plotting limits
+    # --------------------------------------------------------
+
+    padding = 0.08
+
+    x_min = max(
+        -1,
+        min(-0.10, r.min() - padding)
+    )
+
+    x_max = min(
+        1,
+        max(0.10, r.max() + padding)
+    )
+
+    x_grid = np.linspace(x_min, x_max, 500)
+
+    kde = stats.gaussian_kde(
+        r,
+        bw_method="scott"
+    )
+
+    density = kde(x_grid)
+
+    # Normalize KDE height for presentation
+    if density.max() > 0:
+        density /= density.max()
+
+    # --------------------------------------------------------
+    # Colours
+    # --------------------------------------------------------
+
+    fill_colour = "#43B7E9"
+    density_edge_colour = "#26647A"
+    estimate_colour = "#D55E00"
+
+    if uses_gsr:
+        frame_colour = "#08A6C5"
+    else:
+        frame_colour = "#696969"
+
+    # --------------------------------------------------------
+    # Create aligned label and density panels
+    # --------------------------------------------------------
+
+    fig = plt.figure(
+        figsize=figsize,
+        facecolor="white"
+    )
+
+    grid = fig.add_gridspec(
+        nrows=1,
+        ncols=2,
+        width_ratios=[0.20, 1],
+        wspace=0
+    )
+
+    label_ax = fig.add_subplot(grid[0, 0])
+    ax = fig.add_subplot(grid[0, 1])
+
+    # --------------------------------------------------------
+    # Coloured method-label rectangle
+    # --------------------------------------------------------
+
+    label_ax.set_facecolor(frame_colour)
+    label_ax.set_xlim(0, 1)
+    label_ax.set_ylim(0, 1)
+
+    label_ax.text(
+        0.5,
+        0.5,
+        method_name,
+        rotation=90,
+        ha="center",
+        va="center",
+        color="white",
+        fontsize=16,
+        fontweight="bold"
+    )
+
+    label_ax.set_xticks([])
+    label_ax.set_yticks([])
+
+    for spine in label_ax.spines.values():
+        spine.set_color(frame_colour)
+        spine.set_linewidth(3)
+
+    # --------------------------------------------------------
+    # Plotting rectangle
+    # --------------------------------------------------------
+
+    ax.set_facecolor("white")
+
+    # Density distribution
+    ax.fill_between(
+        x_grid,
+        0,
+        density,
+        color=fill_colour,
+        alpha=0.85,
+        zorder=2
+    )
+
+    ax.plot(
+        x_grid,
+        density,
+        color=density_edge_colour,
+        linewidth=1.3,
+        zorder=3
+    )
+
+    # One rug mark for each subject
+    ax.vlines(
+        r,
+        ymin=-0.075,
+        ymax=-0.015,
+        color=density_edge_colour,
+        linewidth=0.8,
+        alpha=0.55,
+        zorder=4
+    )
+
+    # Zero-correlation reference
+    ax.axvline(
+        0,
+        color="#222222",
+        linestyle="--",
+        linewidth=1.8,
+        zorder=4
+    )
+
+    # Fisher-z group estimate
+    ax.axvline(
+        group_r,
+        color=estimate_colour,
+        linewidth=2.8,
+        zorder=5
+    )
+
+    # Bootstrap 95% confidence interval
+    ci_y = -0.115
+
+    ax.plot(
+        [ci_low, ci_high],
+        [ci_y, ci_y],
+        color=estimate_colour,
+        linewidth=3.5,
+        solid_capstyle="round",
+        zorder=5
+    )
+
+    ax.scatter(
+        group_r,
+        ci_y,
+        s=55,
+        color=estimate_colour,
+        edgecolor="white",
+        linewidth=0.7,
+        zorder=6
+    )
+
+    # --------------------------------------------------------
+    # Title and statistical annotation
+    # --------------------------------------------------------
+
+    ax.set_title(
+        title,
+        fontsize=15,
+        fontweight="bold",
+        loc="left",
+        pad=18
+    )
+
+    ax.text(
+        0.03,
+        0.94,
+        (
+            f"n = {len(r)}\n"
+            f"Median r = {median_r:.3f}\n"
+            f"Group r = {group_r:.3f}\n"
+            f"95% CI [{ci_low:.3f}, {ci_high:.3f}]"
+        ),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        linespacing=1.4,
+        zorder=10,
+        bbox={
+            "facecolor": "white",
+            "edgecolor": "none",
+            "alpha": 0.95
+        }
+    )
+
+    # Directly label important lines
+    ax.text(
+        group_r,
+        1.015,
+        "Group estimate",
+        ha="center",
+        va="bottom",
+        fontsize=9,
+        color=estimate_colour
+    )
+
+    # --------------------------------------------------------
+    # Axis formatting
+    # --------------------------------------------------------
+
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(-0.15, 1.08)
+
+    ax.set_xlabel(
+        "Within-run correlation between FD and DVARS",
+        fontsize=12,
+        labelpad=10
+    )
+
+    ax.set_yticks([])
+    ax.set_ylabel("")
+
+    ax.tick_params(
+        axis="x",
+        labelsize=10,
+        pad=5
+    )
+
+    ax.grid(
+        axis="x",
+        color="#D9D9D9",
+        linewidth=0.7,
+        alpha=0.50,
+        zorder=0
+    )
+
+    # Frame around transparent plotting panel
+    for spine in ax.spines.values():
+        spine.set_color(frame_colour)
+        spine.set_linewidth(3)
+
+    # Ensure the shared boundary is aligned
+    label_ax.spines["right"].set_linewidth(3)
+    ax.spines["left"].set_linewidth(3)
+
+    fig.subplots_adjust(
+        left=0.06,
+        right=0.97,
+        bottom=0.20,
+        top=0.88
+    )
+
+    results = {
+        "n_subjects": len(r),
+        "median_r": median_r,
+        "fisher_mean_r": group_r,
+        "ci_low": ci_low,
+        "ci_high": ci_high
+    }
+
+    return fig, results
+
+
+def plot_qcfc_matrix(fig_dir, r_mat, network_labels_csv=DEFAULT_NETWORK_LABELS_CSV) -> None:
+    hemi_network = load_network_labels(network_labels_csv)  # e.g. "LH_Vis", len 400
+    networks = np.array([label.split("_", 1)[1] for label in hemi_network])
+    n_rois = len(hemi_network)
+
+    fig, ax = plt.subplots(figsize=(8, 7))
     im = ax.imshow(r_mat, cmap="RdBu_r", vmin=-1, vmax=1)
     ax.set_title("QC-FC matrix")
-    ax.set_xlabel("ROI")
-    ax.set_ylabel("ROI")
-    # make_axes_locatable derives the colorbar axis from ax's own (post
-    # aspect-adjustment) box, so it always matches the matrix's rendered
-    # height exactly -- fig.colorbar(im, ax=ax) alone does not.
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    # Divide lines at every hemisphere+network block boundary (14 blocks:
+    # 7 networks x 2 hemispheres, contiguous in this atlas's label order).
+    boundaries = np.where(hemi_network[1:] != hemi_network[:-1])[0] + 0.5
+    for b in boundaries:
+        ax.axhline(b, color="black", linewidth=0.6, alpha=0.5)
+        ax.axvline(b, color="black", linewidth=0.6, alpha=0.5)
+
+    # make_axes_locatable derives each appended axis from ax's own (post
+    # aspect-adjustment) box, so the network strips/colorbar always align to
+    # the matrix's actual rendered extent exactly, regardless of figure size.
     divider = make_axes_locatable(ax)
-    cax = divider.append_axes("right", size="5%", pad=0.1)
+
+    network_rgb = np.array([to_rgb(YEO7_NETWORK_COLORS[n]) for n in networks])
+    left_ax = divider.append_axes("left", size="4%", pad=0.05)
+    left_ax.imshow(network_rgb.reshape(n_rois, 1, 3), aspect="auto")
+    left_ax.set_xticks([])
+    left_ax.set_yticks([])
+    left_ax.set_ylabel("ROI")
+
+    top_ax = divider.append_axes("top", size="4%", pad=0.05)
+    top_ax.imshow(network_rgb.reshape(1, n_rois, 3), aspect="auto")
+    top_ax.set_xticks([])
+    top_ax.set_yticks([])
+    top_ax.set_xlabel("ROI")
+    top_ax.xaxis.set_label_position("top")
+
+    cax = divider.append_axes("right", size="5%", pad=0.6)
     fig.colorbar(im, cax=cax, label="QC-FC (r)")
-    fig.tight_layout()
-    fig.savefig(os.path.join(fig_dir, "qc_fc_matrix.png"), dpi=150)
+
+    legend_handles = [Patch(facecolor=colour, label=name) for name, colour in YEO7_NETWORK_COLORS.items()]
+    fig.legend(
+        handles=legend_handles, title="Yeo-7 network", loc="lower center",
+        ncol=7, bbox_to_anchor=(0.46, -0.04), frameon=False, fontsize=8, title_fontsize=9,
+    )
+
+    fig.savefig(os.path.join(fig_dir, "qc_fc_matrix.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -468,6 +845,12 @@ def plot_qcfc_distribution(fig_dir, qcfc_r, method_name) -> None:
         qcfc_r, method_name=method_name, plot_absolute=False, xlim=xlim,
     )
     fig.savefig(os.path.join(fig_dir, "qc_fc_distribution.png"), dpi=200)
+    plt.close(fig)
+
+
+def plot_fd_dvars_correlation_figure(fig_dir, fd_dvars_values, method_name) -> None:
+    fig, _ = plot_subject_fd_dvars_correlations(fd_dvars_values, method_name=method_name)
+    fig.savefig(os.path.join(fig_dir, "fd_dvars_correlation.png"), dpi=200)
     plt.close(fig)
 
 
@@ -631,12 +1014,14 @@ def plot_connectome_figure(fig_dir, r_mat, fdr_mat, connectome_atlas_path) -> No
 def make_plots(
     output_dir, method_name, connectome_atlas_path,
     r_mat, fdr_mat, dist_mat, qcfc_r, q_values, fd, dvars_values, tsnr_values, gs_std_values,
+    fd_dvars_values, network_labels_csv=DEFAULT_NETWORK_LABELS_CSV,
 ) -> None:
     fig_dir = os.path.join(output_dir, "figures")
     os.makedirs(fig_dir, exist_ok=True)
 
-    plot_qcfc_matrix(fig_dir, r_mat)
+    plot_qcfc_matrix(fig_dir, r_mat, network_labels_csv)
     plot_qcfc_distribution(fig_dir, qcfc_r, method_name)
+    plot_fd_dvars_correlation_figure(fig_dir, fd_dvars_values, method_name)
     plot_qcfc_dd_figure(fig_dir, dist_mat, r_mat)
     plot_modularity_q_violin(fig_dir, q_values)
     plot_modularity_q_vs_fd(fig_dir, fd, q_values)
@@ -658,10 +1043,14 @@ def parse_args() -> argparse.Namespace:
         help="Label shown on plots, e.g. 'Raw' or 'ST v4 corrected'",
     )
     parser.add_argument("--connectome_atlas_path", default=DEFAULT_CONNECTOME_ATLAS_PATH)
+    parser.add_argument("--network_labels_csv", default=DEFAULT_NETWORK_LABELS_CSV)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     data = load_results(args.result_dir)
-    make_plots(args.result_dir, args.method_name, args.connectome_atlas_path, **data)
+    make_plots(
+        args.result_dir, args.method_name, args.connectome_atlas_path,
+        network_labels_csv=args.network_labels_csv, **data,
+    )
