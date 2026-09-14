@@ -18,6 +18,7 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass
+from typing import Optional
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
@@ -38,6 +39,11 @@ class ROITimeseriesConfig:
     source_root: str
     output_root: str
     high_pass_hz: float = 0.01
+    # Set to a denoise_runs.py output_root (e.g. motion_corrected_st_v4) to
+    # extract ROI timeseries from a corrected pipeline instead of the raw
+    # volumes -- source_root/output_root stay pointed at the RAW tree either
+    # way (see corrected_volume_path).
+    corrected_root: Optional[str] = None
 
 
 def load_run_volume(path: str) -> torch.Tensor:
@@ -49,14 +55,30 @@ def load_run_volume(path: str) -> torch.Tensor:
     return torch.from_numpy(data).float()
 
 
+def corrected_volume_path(source_volume_path: str, source_root: str, corrected_root: str) -> str:
+    """Raw source_volume_path -> its corrected counterpart, same convention
+    as denoise_runs.py's output_path() (same relative dir, "_corrected"
+    suffix)."""
+    rel_dir = os.path.relpath(os.path.dirname(source_volume_path), source_root)
+    fname = os.path.basename(source_volume_path).replace(".nii.gz", "_corrected.nii.gz")
+    return os.path.join(corrected_root, rel_dir, fname)
+
+
 def output_path(source_volume_path: str, config: ROITimeseriesConfig) -> str:
+    # Always keyed off the RAW source_volume_path/source_root, even when
+    # extracting from corrected volumes -- keeps output_root's directory
+    # structure identical between raw and corrected runs.
     rel_dir = os.path.relpath(os.path.dirname(source_volume_path), config.source_root)
     return os.path.join(config.output_root, rel_dir, "roi_timeseries.npy")
 
 
 def extract_and_filter(row, atlases: dict, config: ROITimeseriesConfig) -> np.ndarray:
     atlas = atlases[row.age_group]
-    volume_seq = load_run_volume(row.source_volume_path)
+    # --corrected_root set -> load the corrected volume instead of raw.
+    volume_path = row.source_volume_path
+    if config.corrected_root:
+        volume_path = corrected_volume_path(volume_path, config.source_root, config.corrected_root)
+    volume_seq = load_run_volume(volume_path)
     roi_ts = atlas.extract_roi_timeseries(volume_seq).numpy()  # (T, n_rois)
     return clean(
         roi_ts, detrend=False, standardize=None,
@@ -112,13 +134,18 @@ def parse_args() -> ROITimeseriesConfig:
         help="Chunk-level metadata CSV (only used for its per-run columns)",
     )
     parser.add_argument(
+        # Keep this pointed at the RAW tree even for a corrected-pipeline
+        # run -- it's only used to compute each run's relative subdir, not
+        # which file gets loaded (see --corrected_root).
         "--source_root", default=(
             "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
             "faizan_motion_correction_dataset/brain_masked_cropped_hfiltered_normalized_to_common_space"
         ),
-        help="Root dir of whole-run source volumes",
+        help="Root dir of RAW whole-run source volumes (do not repoint for corrected runs)",
     )
     parser.add_argument(
+        # Change this to a new dir for a corrected-pipeline run so raw and
+        # corrected ROI timeseries never overwrite each other.
         "--output_root", default=(
             "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
             "faizan_motion_correction_dataset/roi_timeseries_hfiltered_videos"
@@ -127,12 +154,18 @@ def parse_args() -> ROITimeseriesConfig:
     )
     parser.add_argument("--high_pass_hz", type=float, default=0.01,
                          help="Cosine high-pass filter cutoff frequency")
+    parser.add_argument(
+        # e.g. .../motion_corrected_st_v4 -- a denoise_runs.py output_root.
+        "--corrected_root", default=None,
+        help="Set to extract from a corrected pipeline's volumes instead of raw",
+    )
     args = parser.parse_args()
     return ROITimeseriesConfig(
         chunk_metadata_csv=args.chunk_metadata_csv,
         source_root=args.source_root,
         output_root=args.output_root,
         high_pass_hz=args.high_pass_hz,
+        corrected_root=args.corrected_root,
     )
 
 

@@ -4,14 +4,11 @@ denoising_evaluation.py
 Consolidated denoising-quality evaluation across subjects: QC-FC (with FDR
 and median |QC-FC|), QC-FC distance-dependence, network modularity Q
 (correlated with mean FD), and nipype-convention DVARS/tSNR. One pass over
-subjects computes all of these; --plot additionally saves the QC-FC matrix,
-QC-FC-DD scatter+fit, modularity Q violin, and Q-vs-FD scatter.
+subjects computes all of these and writes the results (manifest.csv,
+qc_fc_*.npy, distance_matrix.npy, summary.txt) to output_dir.
 
-DVARS/tSNR reuse nipype's exact formulas (verified to match nipype's own
-file-writing ComputeDVARS/TSNR nodes to floating-point precision) but take
-already-loaded arrays and write nothing to disk -- nipype's bare functions
-either don't exist (TSNR) or require file paths (compute_dvars), neither of
-which fits a per-subject loop over 100+ runs.
+This script only computes and saves data -- see plot_denoising_qc.py for
+generating figures from these saved results.
 """
 import argparse
 import os
@@ -21,28 +18,20 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-
-import matplotlib.pyplot as plt
 import nibabel as nib
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import torch
 from netneurotools.modularity import consensus_modularity
 from nilearn import plotting
 from scipy import stats
-from statsmodels.nonparametric.smoothers_lowess import lowess
 from statsmodels.stats.multitest import multipletests
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from losses import _pearson_corr_matrix
 
-# All evaluation runs (raw baseline, each corrected pipeline, ...) land here,
-# one uniquely-named subfolder per pipeline -- so results never get scattered
-# across the dataset root or silently overwritten by the next run.
-PIPELINE_EVAL_ROOT = (
-    "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
-    "faizan_motion_correction_dataset/motion_denoising_pipeline_level_evaluation"
+PIPELINE_EVAL_ROOT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "motion_denoising_pipeline_level_evaluation"
 )
 
 @dataclass
@@ -51,19 +40,20 @@ class EvalConfig:
     source_root: str
     roi_timeseries_root: str
     atlas_path: str
-    connectome_atlas_path: str
     output_dir: str
     edge_alpha: float = 0.05
-    edge_percentile: str = "98%"
     repeats: int = 100
     gamma: float = 1.0
     seed: int = 12345
-    plot: bool = False
     max_subjects: Optional[int] = None
     log_path: str = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "connectivity", "results", "run_log.csv"
     )
     run_label: str = "raw"
+    # Set to a denoise_runs.py output_root (e.g. motion_corrected_st_v4) to
+    # evaluate a corrected pipeline's DVARS/tSNR/global-signal-std instead of
+    # the raw volumes -- source_root stays pointed at the RAW tree either way.
+    corrected_root: Optional[str] = None
 
 def get_git_commit() -> str:
     try:
@@ -90,7 +80,6 @@ def append_run_log(config: EvalConfig, n: int, metrics: dict) -> None:
         "repeats": config.repeats,
         "gamma": config.gamma,
         "edge_alpha": config.edge_alpha,
-        "edge_percentile": config.edge_percentile,
         **metrics,
     }
     os.makedirs(os.path.dirname(config.log_path), exist_ok=True)
@@ -169,6 +158,15 @@ def load_run_volume_and_mask(source_volume_path: str) -> tuple:
     return func, mask
 
 
+def corrected_volume_path(source_volume_path: str, source_root: str, corrected_root: str) -> str:
+    """Raw source_volume_path -> its corrected counterpart, same convention
+    as denoise_runs.py's output_path() (same relative dir, "_corrected"
+    suffix)."""
+    rel_dir = os.path.relpath(os.path.dirname(source_volume_path), source_root)
+    fname = os.path.basename(source_volume_path).replace(".nii.gz", "_corrected.nii.gz")
+    return os.path.join(corrected_root, rel_dir, fname)
+
+
 def nipype_dvars(
     func: np.ndarray,
     mask: np.ndarray,
@@ -216,6 +214,13 @@ def nipype_tsnr(func: np.ndarray, mask: np.ndarray) -> float:
     return float(tsnr_img[mask].mean())
 
 
+def global_signal_std(func: np.ndarray, mask: np.ndarray) -> float:
+    """Std over time of the whole-brain mean signal (global signal), same
+    definition as train.py's compute_global_signal_std."""
+    global_signal = func[mask].mean(axis=0)
+    return float(global_signal.std())
+
+
 def run_evaluation(config: EvalConfig) -> dict:
     runs = select_first_runs(config)
     if config.max_subjects is not None:
@@ -224,7 +229,7 @@ def run_evaluation(config: EvalConfig) -> dict:
     print(f"{n} subjects")
 
     n_rois, edge_rows, fds, q_values, subject_ids = None, [], [], [], []
-    dvars_values, tsnr_values = [], []
+    dvars_values, tsnr_values, gs_std_values = [], [], []
     for row in runs.itertuples(index=False):
         roi_ts = np.load(roi_ts_path(row.source_volume_path, config))
         fc = _pearson_corr_matrix(torch.from_numpy(roi_ts).float()).numpy()
@@ -237,16 +242,23 @@ def run_evaluation(config: EvalConfig) -> dict:
         q_values.append(consensus_q_from_fc(fc, config))
         subject_ids.append(row.subject_id)
 
-        # DVARS/tSNR need the raw run volume, not the ROI timeseries used above
-        func, mask = load_run_volume_and_mask(row.source_volume_path)
+        # DVARS/tSNR/global-signal-std need the run volume itself, not the
+        # ROI timeseries used above. --corrected_root set -> load the
+        # corrected volume instead of raw.
+        volume_path = row.source_volume_path
+        if config.corrected_root:
+            volume_path = corrected_volume_path(volume_path, config.source_root, config.corrected_root)
+        func, mask = load_run_volume_and_mask(volume_path)
         dvars_values.append(nipype_dvars(func, mask))
         tsnr_values.append(nipype_tsnr(func, mask))
+        gs_std_values.append(global_signal_std(func, mask))
 
     edges = np.stack(edge_rows)
     fd = np.array(fds)
     q_values = np.array(q_values)
     dvars_values = np.array(dvars_values)
     tsnr_values = np.array(tsnr_values)
+    gs_std_values = np.array(gs_std_values)
 
     if n < 3:
         raise ValueError("At least 3 independent subjects are required")
@@ -290,9 +302,9 @@ def run_evaluation(config: EvalConfig) -> dict:
 
     print(f"DVARS (nipype convention): mean={dvars_values.mean():.4f}, sd={dvars_values.std(ddof=1):.4f}")
     print(f"tSNR (nipype convention): mean={tsnr_values.mean():.4f}, sd={tsnr_values.std(ddof=1):.4f}")
+    print(f"Global signal std: mean={gs_std_values.mean():.4f}, sd={gs_std_values.std(ddof=1):.4f}")
 
     os.makedirs(config.output_dir, exist_ok=True)
-    os.makedirs(os.path.join(config.output_dir, "figures"), exist_ok=True)
     r_mat = np.full((n_rois, n_rois), np.nan)
     p_mat = np.full((n_rois, n_rois), np.nan)
     fdr_mat = np.zeros((n_rois, n_rois), dtype=bool)
@@ -309,7 +321,7 @@ def run_evaluation(config: EvalConfig) -> dict:
     np.save(os.path.join(config.output_dir, "distance_matrix.npy"), dist)
     pd.DataFrame({
         "subject_id": subject_ids, "mean_fd": fd, "Q": q_values,
-        "dvars": dvars_values, "tsnr": tsnr_values,
+        "dvars": dvars_values, "tsnr": tsnr_values, "gs_std": gs_std_values,
     }).to_csv(os.path.join(config.output_dir, "manifest.csv"), index=False)
     with open(os.path.join(config.output_dir, "summary.txt"), "w") as f:
         f.write(f"n_subjects: {n}\n")
@@ -325,6 +337,8 @@ def run_evaluation(config: EvalConfig) -> dict:
         f.write(f"dvars_sd: {dvars_values.std(ddof=1):.4f}\n")
         f.write(f"tsnr_mean: {tsnr_values.mean():.4f}\n")
         f.write(f"tsnr_sd: {tsnr_values.std(ddof=1):.4f}\n")
+        f.write(f"gs_std_mean: {gs_std_values.mean():.4f}\n")
+        f.write(f"gs_std_sd: {gs_std_values.std(ddof=1):.4f}\n")
     print(f"saved results -> {config.output_dir}")
     append_run_log(config, n, {
         "fdr_significant_edges": int(fdr_significant.sum()),
@@ -340,127 +354,16 @@ def run_evaluation(config: EvalConfig) -> dict:
         "dvars_sd": dvars_values.std(ddof=1),
         "tsnr_mean": tsnr_values.mean(),
         "tsnr_sd": tsnr_values.std(ddof=1),
+        "gs_std_mean": gs_std_values.mean(),
+        "gs_std_sd": gs_std_values.std(ddof=1),
     })
-
-    if config.plot:
-        make_plots(config, r_mat, fdr_mat, dist_edges, qcfc_r, q_values, fd, dvars_values, tsnr_values)
 
     return {
         "qcfc_r": r_mat, "qcfc_fdr_significant": fdr_mat, "median_abs_qcfc": median_abs_qcfc,
         "dd_r": dd_r, "dd_p": dd_p, "Q": q_values, "mean_fd": fd,
         "q_fd_r": q_fd_r, "q_fd_p": q_fd_p,
-        "dvars": dvars_values, "tsnr": tsnr_values,
+        "dvars": dvars_values, "tsnr": tsnr_values, "gs_std": gs_std_values,
     }
-
-def make_plots(config: EvalConfig, r_mat, fdr_mat, dist_edges, qcfc_r, q_values, fd,
-               dvars_values, tsnr_values) -> None:
-    fig_dir = os.path.join(config.output_dir, "figures")
-    os.makedirs(fig_dir, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(7, 6))
-    im = ax.imshow(r_mat, cmap="RdBu_r", vmin=-1, vmax=1)
-    ax.set_title("QC-FC matrix")
-    ax.set_xlabel("ROI")
-    ax.set_ylabel("ROI")
-    fig.colorbar(im, ax=ax, label="QC-FC (r)")
-    fig.tight_layout()
-    fig.savefig(os.path.join(fig_dir, "qc_fc_matrix.png"), dpi=150)
-    plt.close(fig)
-
-    smoothed = lowess(qcfc_r, dist_edges, frac=0.3)
-    fig, ax = plt.subplots(figsize=(7, 6))
-    ax.scatter(dist_edges, qcfc_r, s=2, alpha=0.15, color="gray")
-    ax.plot(smoothed[:, 0], smoothed[:, 1], color="crimson", linewidth=2)
-    ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
-    ax.set_xlabel("ROI-pair distance (mm)")
-    ax.set_ylabel("QC-FC (r)")
-    ax.set_title("QC-FC distance dependence")
-    fig.tight_layout()
-    fig.savefig(os.path.join(fig_dir, "qc_fc_distance_dependence.png"), dpi=150)
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(5, 6))
-    sns.violinplot(y=q_values, ax=ax, width=0.7, inner="quartile", color="#54A24B", alpha=0.6)
-    sns.stripplot(y=q_values, ax=ax, color="black", size=3, jitter=0.15, alpha=0.4)
-    ax.set_xlabel(f"Subjects (n={len(q_values)})")
-    ax.set_ylabel("Modularity Q")
-    ax.spines[["top", "right"]].set_visible(False)
-    ax.set_title("Modularity Q")
-    fig.tight_layout()
-    fig.savefig(os.path.join(fig_dir, "modularity_q_violin.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.scatter(fd, q_values, s=15, alpha=0.7)
-    slope, intercept, *_ = stats.linregress(fd, q_values)
-    xs = np.linspace(fd.min(), fd.max(), 100)
-    ax.plot(xs, slope * xs + intercept, color="crimson")
-    ax.set_xlabel("Mean FD")
-    ax.set_ylabel("Modularity Q")
-    ax.set_title("Modularity Q vs mean FD")
-    fig.tight_layout()
-    fig.savefig(os.path.join(fig_dir, "modularity_q_vs_fd.png"), dpi=150)
-    plt.close(fig)
-
-    sim_df = pd.DataFrame({"Mean_DVARS": dvars_values, "Mean_tSNR": tsnr_values})
-    fig, axes = plt.subplots(1, 2, figsize=(10, 6))
-    metrics = [
-        ("Mean_DVARS", "Mean DVARS", "#4C78A8"),
-        ("Mean_tSNR", "Mean tSNR", "#F58518"),
-    ]
-    for ax, (column, ylabel, colour) in zip(axes, metrics):
-        sns.violinplot(
-            data=sim_df, y=column, ax=ax, width=0.7,
-            inner="quartile", color=colour, alpha=0.6,
-        )
-        sns.stripplot(
-            data=sim_df, y=column, ax=ax,
-            color="black", size=3, jitter=0.15, alpha=0.4,
-        )
-        ax.set_xlabel(f"Subjects (n={len(sim_df)})")
-        ax.set_ylabel(ylabel)
-        ax.spines[["top", "right"]].set_visible(False)
-    plt.suptitle(f"DVARS and tSNR (nipype convention, n={len(sim_df)} subjects)", y=1.02)
-    fig.tight_layout()
-    fig.savefig(os.path.join(fig_dir, "dvars_tsnr_violin.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-    if not fdr_mat.any():
-        print("no FDR-significant edges -- skipping connectome plot")
-    else:
-        # Nilearn-style connectome: default schematic glass brain (no real
-        # anatomy), node coords from the standard adult FSLMNI152 Schaefer
-        # atlas -- a different template than config.atlas_path (which stays
-        # the correct infant-space atlas for the distance matrix/QC-FC-DD
-        # above). ROI identity (label order) still matches; only the display
-        # coordinates come from the adult template, for a familiar/legible
-        # schematic rather than an anatomically-exact infant background.
-        coords, _ = plotting.find_parcellation_cut_coords(
-            config.connectome_atlas_path, return_label_names=True
-        )
-        adjacency = np.where(fdr_mat, r_mat, 0)
-        n_significant = int(fdr_mat.sum() / 2)
-        top_pct = 100 - int(config.edge_percentile.rstrip("%"))
-
-        fig = plt.figure(figsize=(9, 7))
-        plotting.plot_connectome(
-            adjacency_matrix=adjacency,
-            node_coords=coords,
-            display_mode="ortho",
-            node_color="#555555",
-            node_size=8,
-            edge_cmap="RdBu_r",
-            edge_threshold=config.edge_percentile,
-            edge_kwargs={"linewidth": 1.0, "alpha": 0.85},
-            title=f"QC-FC -- top {top_pct}% strongest of {n_significant:,} FDR-significant edges",
-            annotate=False,
-            colorbar=True,
-            figure=fig,
-        )
-        fig.savefig(os.path.join(fig_dir, "connectome.png"), dpi=150, bbox_inches="tight")
-        plt.close(fig)
-
-    print(f"saved plots -> {config.output_dir}")
 
 def parse_args() -> EvalConfig:
     parser = argparse.ArgumentParser(description="Denoising evaluation: QC-FC, QC-FC-DD, network modularity")
@@ -472,27 +375,31 @@ def parse_args() -> EvalConfig:
         ),
     )
     parser.add_argument(
+        # Keep pointed at the RAW tree even for a corrected-pipeline run --
+        # only used to compute each run's relative subdir (see --corrected_root).
         "--source_root", default=(
             "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
             "faizan_motion_correction_dataset/brain_masked_cropped_hfiltered_normalized_to_common_space"
         ),
     )
     parser.add_argument(
+        # For a corrected pipeline, point this at the ROI timeseries
+        # extracted from the corrected volumes (create_roi_timeseries.py
+        # --corrected_root), not the raw ones.
         "--roi_timeseries_root", default=(
             "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
             "faizan_motion_correction_dataset/roi_timeseries_hfiltered_videos"
         ),
     )
     parser.add_argument(
+        # e.g. .../motion_corrected_st_v4 -- a denoise_runs.py output_root.
+        "--corrected_root", default=None,
+        help="Set to evaluate DVARS/tSNR/global-signal-std on a corrected pipeline instead of raw",
+    )
+    parser.add_argument(
         "--atlas_path", default=(
             "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
             "templates/rois/Schaefer2018_400Parcels_7Networks_order_space-nihpd-02-05_2mm.nii.gz"
-        ),
-    )
-    parser.add_argument(
-        "--connectome_atlas_path", default=(
-            "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
-            "templates/rois/Schaefer2018_400Parcels_7Networks_order_FSLMNI152_2mm.nii.gz"
         ),
     )
     parser.add_argument(
@@ -503,11 +410,9 @@ def parse_args() -> EvalConfig:
         ),
     )
     parser.add_argument("--edge_alpha", type=float, default=0.05)
-    parser.add_argument("--edge_percentile", default="98%")
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=12345)
-    parser.add_argument("--plot", action="store_true")
     parser.add_argument("--max_subjects", type=int, default=None,
                          help="Limit to the first N selected subjects (for quick testing)")
     parser.add_argument("--debug", action="store_true",

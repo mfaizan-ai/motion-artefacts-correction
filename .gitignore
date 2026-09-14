@@ -39,7 +39,7 @@ seq_v1_buggy_norm_archive/
 
 # Dataset CSVs (generated, not source)
 dataset/*.csv
-
+slurm/
 # Dataset creation scripts (HPC-specific, not portable)
 dataset_creation_scripts/
 
