@@ -42,6 +42,8 @@ dataset/*.csv
 slurm/
 # Dataset creation scripts (HPC-specific, not portable)
 dataset_creation_scripts/
+ISC_analysis/figures/
+ISC_analysis/results/
 
 # Experimental / diagnostic scripts
 atlas_fc.py

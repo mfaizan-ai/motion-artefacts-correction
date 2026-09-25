@@ -9,9 +9,17 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
 
 DEST_ROOT = "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/isc_segmenting/isc_comparison_data_cyclegans"
-FIGURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures_raw_data_network_level")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+FIGURES_ROOT = os.path.join(SCRIPT_DIR, "figures")
+RESULTS_ROOT = os.path.join(SCRIPT_DIR, "results")
+
+
+def source_dir_name(source):
+    return "raw_data_network_level" if source == "raw" else source
 
 
 def load_timecourses_manifest(order, source):
@@ -145,6 +153,16 @@ def group_summary(isc):
     return inverse_fisher_z(fisher_z(isc).mean(axis=0))
 
 
+def isc_significance(isc, alpha=0.05):
+    """Two-sided one-sample t-test on each column's across-subject Fisher-z ISC values
+    (against 0), BH-FDR corrected across columns -- same statistical convention used
+    throughout this project's QC-FC/FC significance analyses (denoising_evaluation.py)."""
+    z = fisher_z(isc)
+    t, p = stats.ttest_1samp(z, popmean=0.0, axis=0)
+    significant, q, _, _ = multipletests(p, alpha=alpha, method="fdr_bh")
+    return t, p, q, significant
+
+
 def full_pearson_matrix(a, b):
     a = a - a.mean(axis=1, keepdims=True)
     b = b - b.mean(axis=1, keepdims=True)
@@ -221,6 +239,14 @@ def save_group_summary(path, column_names, summary):
         writer.writerow(list(summary))
 
 
+def save_significance(path, column_names, summary, t, p, q, significant):
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["name", "group_isc", "t", "p", "q", "significant"])
+        for name, isc_val, t_val, p_val, q_val, sig in zip(column_names, summary, t, p, q, significant):
+            writer.writerow([name, isc_val, t_val, p_val, q_val, sig])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--order", default="A")
@@ -244,22 +270,39 @@ def main():
 
     subjects, roi_isc = compute_all_isc(all_series, "roi")
     save_matrix(os.path.join(out_dir, f"order_{args.order}{tag_suffix}_roi_isc.csv"), subjects, roi_labels, roi_isc)
-    save_group_summary(os.path.join(out_dir, f"order_{args.order}{tag_suffix}_roi_isc_group.csv"), roi_labels, group_summary(roi_isc))
+    roi_group = group_summary(roi_isc)
+    save_group_summary(os.path.join(out_dir, f"order_{args.order}{tag_suffix}_roi_isc_group.csv"), roi_labels, roi_group)
+    roi_t, roi_p, roi_q, roi_sig = isc_significance(roi_isc)
+    save_significance(
+        os.path.join(out_dir, f"order_{args.order}{tag_suffix}_roi_isc_significance.csv"),
+        roi_labels, roi_group, roi_t, roi_p, roi_q, roi_sig,
+    )
+    print(f"ROI ISC: {int(roi_sig.sum())}/{len(roi_sig)} FDR-significant (N={len(subjects)} subjects)", flush=True)
 
     subjects, network_isc = compute_all_isc(all_series, "network")
     save_matrix(os.path.join(out_dir, f"order_{args.order}{tag_suffix}_network_isc.csv"), subjects, network_names, network_isc)
-    save_group_summary(os.path.join(out_dir, f"order_{args.order}{tag_suffix}_network_isc_group.csv"), network_names, group_summary(network_isc))
+    network_group = group_summary(network_isc)
+    save_group_summary(os.path.join(out_dir, f"order_{args.order}{tag_suffix}_network_isc_group.csv"), network_names, network_group)
+    net_t, net_p, net_q, net_sig = isc_significance(network_isc)
+    save_significance(
+        os.path.join(out_dir, f"order_{args.order}{tag_suffix}_network_isc_significance.csv"),
+        network_names, network_group, net_t, net_p, net_q, net_sig,
+    )
+    print(f"Network ISC: {int(net_sig.sum())}/{len(net_sig)} FDR-significant (N={len(subjects)} subjects)", flush=True)
 
     print(f"Wrote ISC results to {out_dir}", flush=True)
 
-    figures_dir = FIGURES_DIR if args.source == "raw" else os.path.join(os.path.dirname(FIGURES_DIR), f"figures_{args.source}_data")
+    dir_name = source_dir_name(args.source)
+    figures_dir = os.path.join(FIGURES_ROOT, dir_name)
+    results_dir = os.path.join(RESULTS_ROOT, dir_name)
     os.makedirs(figures_dir, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
     isfc_subjects, network_isfc = compute_all_isfc(all_series, "network")
     group_network_isfc = symmetrize(group_isfc_summary(network_isfc))
 
-    np.save(os.path.join(figures_dir, f"order_{args.order}{tag_suffix}_network_isfc_persubject.npy"), network_isfc)
+    np.save(os.path.join(results_dir, f"order_{args.order}{tag_suffix}_network_isfc_persubject.npy"), network_isfc)
     save_isfc_group_csv(
-        os.path.join(figures_dir, f"order_{args.order}{tag_suffix}_network_isfc_group.csv"), network_names, group_network_isfc
+        os.path.join(results_dir, f"order_{args.order}{tag_suffix}_network_isfc_group.csv"), network_names, group_network_isfc
     )
 
     plot_isfc_heatmap(
@@ -267,7 +310,7 @@ def main():
         f"Order {args.order} ({args.source}) — 7x7 network ISC (group, N={len(isfc_subjects)})",
         os.path.join(figures_dir, f"order_{args.order}{tag_suffix}_network_isfc_group_heatmap.png"),
     )
-    print(f"Wrote 7x7 network ISFC matrix + figure to {figures_dir}", flush=True)
+    print(f"Wrote 7x7 network ISFC results -> {results_dir}, figure -> {figures_dir}", flush=True)
 
 
 if __name__ == "__main__":

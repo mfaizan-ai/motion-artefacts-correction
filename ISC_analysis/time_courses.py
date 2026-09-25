@@ -12,6 +12,14 @@ DEST_ROOT = "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/isc_se
 ATLAS_PATH = "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/templates/rois/Schaefer2018_400Parcels_7Networks_order_space-nihpd-02-05_2mm.nii.gz"
 LUT_PATH = "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/templates/rois/Schaefer2018_400Parcels_7Networks_order.lut"
 
+# ATLAS_PATH is on the native (97,116,79) grid. Chunks built from the cropped/hfiltered
+# training data are (60,72,56) instead -- --cropped_2mo_atlas crops the atlas to match, using
+# the exact 2mo window from build_dataset.py (verified in experimental_notebooks/
+# isc_train_data_raw_denoised_atlas_overlay.ipynb: recovers all 400 ROIs, correct anatomical
+# overlay on both raw and denoised). ROI IDs are unchanged by cropping (plain array slice), so
+# the LUT-based name/network lookup below applies to the cropped atlas without any changes.
+AGE_CROP_2MO = {"x": (17, 77), "y": (26, 98), "z": (11, 67)}
+
 
 def load_roi_network_map(lut_path):
     roi_names = {}
@@ -29,9 +37,11 @@ def load_roi_network_map(lut_path):
     return roi_names, network_per_roi, network_names
 
 
-def load_atlas(atlas_path):
+def load_atlas(atlas_path, crop=None):
     atlas_img = nib.load(atlas_path)
     atlas_data = np.asarray(atlas_img.dataobj).astype(np.int32)
+    if crop is not None:
+        atlas_data = atlas_data[crop["x"][0]:crop["x"][1], crop["y"][0]:crop["y"][1], crop["z"][0]:crop["z"][1]]
     return atlas_data
 
 
@@ -130,11 +140,16 @@ def main():
                      help="'raw', or a DEST_ROOT subdirectory name produced by motion_correct.py's "
                           "--out_dir_name (e.g. 'motion_corrected', 'motion_correction_with_residual').")
     ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument(
+        "--cropped_2mo_atlas", action="store_true",
+        help="Crop the atlas to the 2mo (60,72,56) window instead of using it on the native "
+             "(97,116,79) grid -- required for chunks built from cropped/hfiltered training data.",
+    )
     args = ap.parse_args()
 
     roi_names, network_per_roi, network_names = load_roi_network_map(LUT_PATH)
     n_roi = len(roi_names)
-    atlas_data = load_atlas(ATLAS_PATH)
+    atlas_data = load_atlas(ATLAS_PATH, crop=AGE_CROP_2MO if args.cropped_2mo_atlas else None)
 
     rows = load_manifest(args.order, args.source)
     print(f"Rows for order {args.order}, source={args.source} (excluding A-suffix subjects): {len(rows)}", flush=True)
