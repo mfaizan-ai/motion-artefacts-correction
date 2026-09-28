@@ -18,6 +18,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+
+from denoising_evaluation import PIPELINE_EVAL_ROOT
 from matplotlib.colors import Normalize, to_rgb
 from matplotlib.patches import Patch
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -398,6 +400,72 @@ def plot_single_qcfc_distribution(
         "median_absolute_qcfc": median_absolute,
         "n_edges": len(values)
     }
+
+
+def plot_fc_magnitude_distribution_grid(datasets, output_path, xlim=None, figsize=(11, 8.5)) -> None:
+    """FC-value counterpart of plot_single_qcfc_distribution's density-plot
+    styling, laid out as a 2x2 grid of self-contained subplots -- one per
+    dataset, titled rather than sharing a side label column, so each full
+    distribution renders without being squeezed against a label panel.
+
+    datasets: [(label, mean_z_matrix), ...] -- each matrix's upper-triangle
+    Fisher-z values are back-transformed to signed r and plotted as-is (both
+    positive and negative edges kept, not folded to |r|), with a dashed
+    zero-reference line and the signed median marked, analogous to how
+    plot_single_qcfc_distribution's signed mode marks r=0.
+    """
+    fill_colour = "#43B7E9"
+    density_edge_colour = "#405763"
+    median_colour = "#075985"
+
+    per_dataset = []
+    for label, mean_z_mat in datasets:
+        iu = np.triu_indices(mean_z_mat.shape[0], k=1)
+        r_values = np.tanh(mean_z_mat[iu])
+        r_values = r_values[np.isfinite(r_values)]
+        per_dataset.append((label, r_values))
+
+    if xlim is None:
+        combined_min = min(values.min() for _, values in per_dataset)
+        combined_max = max(values.max() for _, values in per_dataset)
+        margin = 0.05 * (combined_max - combined_min)
+        xlim = (combined_min - margin, combined_max + margin)
+
+    ncols = 2
+    nrows = int(np.ceil(len(per_dataset) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
+    axes = np.atleast_1d(axes).ravel()
+    x_grid = np.linspace(xlim[0], xlim[1], 500)
+
+    for ax, (label, r_values) in zip(axes, per_dataset):
+        median_signed = float(np.median(r_values))
+        kde = stats.gaussian_kde(r_values, bw_method="scott")
+        density = kde(x_grid)
+        peak = density.max()
+        if peak > 0:
+            density /= peak
+
+        ax.fill_between(x_grid, 0, density, color=fill_colour, alpha=1, zorder=2)
+        ax.plot(x_grid, density, color=density_edge_colour, linewidth=1, zorder=3)
+        median_height = float(kde(median_signed)[0]) / peak if peak > 0 else 0
+        ax.vlines(median_signed, 0, median_height, color=median_colour, linewidth=3, zorder=4)
+        ax.text(0.96, 0.92, rf"Median $FC$ = {median_signed:.3f}", transform=ax.transAxes,
+                ha="right", va="top", fontsize=11, fontweight="bold")
+
+        ax.set_title(label, fontsize=13, fontweight="bold")
+        ax.set_xlim(xlim)
+        ax.set_ylim(0, 1.08)
+        ax.set_yticks([])
+        ax.set_xlabel("FC correlation (r)", fontsize=11)
+        ax.tick_params(axis="x", labelsize=10)
+        ax.spines[["top", "right", "left"]].set_visible(False)
+
+    for ax in axes[len(per_dataset):]:
+        ax.axis("off")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 def plot_q_vs_fd(mean_fd, q_values):
@@ -781,14 +849,22 @@ def plot_subject_fd_dvars_correlations(
     return fig, results
 
 
-def plot_qcfc_matrix(fig_dir, r_mat, network_labels_csv=DEFAULT_NETWORK_LABELS_CSV) -> None:
+def plot_annotated_matrix(
+    fig_dir, filename, mat, title, colorbar_label, vmin, vmax,
+    cmap="RdBu_r", network_labels_csv=DEFAULT_NETWORK_LABELS_CSV,
+) -> None:
+    """400x400 ROI-by-ROI matrix, annotated with Yeo-7 network color strips
+    (left/top) and block-boundary lines. Reused for both the QC-FC matrix and
+    the across-subject mean FC matrix -- only the data/colorbar range/title
+    differ."""
+    os.makedirs(fig_dir, exist_ok=True)
     hemi_network = load_network_labels(network_labels_csv)  # e.g. "LH_Vis", len 400
     networks = np.array([label.split("_", 1)[1] for label in hemi_network])
     n_rois = len(hemi_network)
 
     fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(r_mat, cmap="RdBu_r", vmin=-1, vmax=1)
-    ax.set_title("QC-FC matrix")
+    im = ax.imshow(mat, cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_title(title)
     ax.set_xticks([])
     ax.set_yticks([])
 
@@ -819,16 +895,107 @@ def plot_qcfc_matrix(fig_dir, r_mat, network_labels_csv=DEFAULT_NETWORK_LABELS_C
     top_ax.xaxis.set_label_position("top")
 
     cax = divider.append_axes("right", size="5%", pad=0.6)
-    fig.colorbar(im, cax=cax, label="QC-FC (r)")
+    fig.colorbar(im, cax=cax, label=colorbar_label)
 
     legend_handles = [Patch(facecolor=colour, label=name) for name, colour in YEO7_NETWORK_COLORS.items()]
     fig.legend(
         handles=legend_handles, title="Yeo-7 network", loc="lower center",
         ncol=7, bbox_to_anchor=(0.46, -0.04), frameon=False, fontsize=8, title_fontsize=9,
     )
-
-    fig.savefig(os.path.join(fig_dir, "qc_fc_matrix.png"), dpi=150, bbox_inches="tight")
+    fig.savefig(os.path.join(fig_dir, filename), dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_qcfc_matrix(fig_dir, r_mat, network_labels_csv=DEFAULT_NETWORK_LABELS_CSV) -> None:
+    plot_annotated_matrix(
+        fig_dir, "qc_fc_matrix.png", r_mat, title="QC-FC matrix", colorbar_label="QC-FC (r)",
+        vmin=-1, vmax=1, network_labels_csv=network_labels_csv,
+    )
+
+
+def plot_mean_fc_matrix(fig_dir, mean_z_mat, network_labels_csv=DEFAULT_NETWORK_LABELS_CSV, vmax=None) -> None:
+    if vmax is None:
+        vmax = float(np.nanmax(np.abs(mean_z_mat)))
+    plot_annotated_matrix(
+        fig_dir, "mean_fc_matrix.png", mean_z_mat, title="Mean FC matrix (Fisher-z, across subjects)",
+        colorbar_label="Mean Fisher-z FC", vmin=-vmax, vmax=vmax, network_labels_csv=network_labels_csv,
+    )
+
+
+def robust_symmetric_limit(*matrices, percentile=99) -> float:
+    """99th-percentile |value| across all given matrices (NaNs dropped) --
+    avoids a few extreme edges from stretching the color scale so far that
+    everything else looks washed out."""
+    combined = np.concatenate([m[np.isfinite(m)].ravel() for m in matrices])
+    return float(np.percentile(np.abs(combined), percentile))
+
+
+def plot_fc_matrix_comparison(
+    raw_dir, denoised_dir, comparison_dir, network_labels_csv=DEFAULT_NETWORK_LABELS_CSV,
+    reference_dir=None,
+) -> None:
+    """Puts the raw and denoised mean-FC matrices on the same color scale
+    (robust 99th-percentile limit, shared across both), overwriting each
+    pipeline's own mean_fc_matrix.png in place, and adds two delta matrices,
+    kept side by side rather than one replacing the other since they answer
+    different questions:
+      - signed delta (denoised - raw): did this edge become more/less
+        positive? Can misread a sign-flipping edge as "decreased" even when
+        its magnitude grew (e.g. raw=+0.1 -> denoised=-0.5).
+      - |FC| delta (|denoised| - |raw|): did this connection's strength
+        grow or shrink, regardless of sign -- the unambiguous attenuation
+        matrix.
+
+    If reference_dir is given (e.g. the low-motion resting-state reference),
+    its mean-FC matrix is folded into the same shared p99 limit and
+    overwritten in place too, so all three matrices sit on one fair,
+    directly-comparable color scale -- it plays no part in the delta matrices,
+    which stay raw-vs-denoised only.
+    """
+    raw_mean_z = np.load(os.path.join(raw_dir, "fc_mean_z.npy"))
+    denoised_mean_z = np.load(os.path.join(denoised_dir, "fc_mean_z.npy"))
+
+    matrices_for_limit = [raw_mean_z, denoised_mean_z]
+    reference_mean_z = None
+    if reference_dir:
+        reference_mean_z = np.load(os.path.join(reference_dir, "fc_mean_z.npy"))
+        matrices_for_limit.append(reference_mean_z)
+
+    shared_limit = robust_symmetric_limit(*matrices_for_limit)
+    plot_mean_fc_matrix(os.path.join(raw_dir, "figures"), raw_mean_z, network_labels_csv, vmax=shared_limit)
+    plot_mean_fc_matrix(os.path.join(denoised_dir, "figures"), denoised_mean_z, network_labels_csv, vmax=shared_limit)
+    if reference_dir:
+        plot_mean_fc_matrix(
+            os.path.join(reference_dir, "figures"), reference_mean_z, network_labels_csv, vmax=shared_limit,
+        )
+
+    fig_dir = os.path.join(comparison_dir, "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+
+    delta_signed = denoised_mean_z - raw_mean_z
+    signed_limit = robust_symmetric_limit(delta_signed)
+    plot_annotated_matrix(
+        fig_dir, "delta_fc_matrix_signed.png", delta_signed, title="ΔFC = denoised − raw (Fisher-z)",
+        colorbar_label="Δ Mean Fisher-z FC", vmin=-signed_limit, vmax=signed_limit,
+        network_labels_csv=network_labels_csv,
+    )
+
+    delta_abs = np.abs(denoised_mean_z) - np.abs(raw_mean_z)
+    abs_limit = robust_symmetric_limit(delta_abs)
+    plot_annotated_matrix(
+        fig_dir, "delta_fc_matrix_abs.png", delta_abs, title="Δ|FC| = |denoised| − |raw| (Fisher-z)",
+        colorbar_label="Δ |Mean Fisher-z FC|", vmin=-abs_limit, vmax=abs_limit,
+        network_labels_csv=network_labels_csv,
+    )
+
+    print(f"shared FC color limit: ±{shared_limit:.4f}")
+    print(f"signed delta limit: ±{signed_limit:.4f}, |FC| delta limit: ±{abs_limit:.4f}")
+    print(f"overwrote -> {os.path.join(raw_dir, 'figures', 'mean_fc_matrix.png')}")
+    print(f"overwrote -> {os.path.join(denoised_dir, 'figures', 'mean_fc_matrix.png')}")
+    if reference_dir:
+        print(f"overwrote -> {os.path.join(reference_dir, 'figures', 'mean_fc_matrix.png')}")
+    print(f"saved -> {os.path.join(fig_dir, 'delta_fc_matrix_signed.png')}")
+    print(f"saved -> {os.path.join(fig_dir, 'delta_fc_matrix_abs.png')}")
 
 
 def plot_qcfc_distribution(fig_dir, qcfc_r, method_name) -> None:
@@ -1011,6 +1178,87 @@ def plot_connectome_figure(fig_dir, r_mat, fdr_mat, connectome_atlas_path) -> No
     plt.close(fig)
 
 
+def plot_fc_connectome_figure(fig_dir, mean_z_mat, fc_significant_mat, connectome_atlas_path) -> None:
+    """Same layout as plot_connectome_figure, but for FC itself rather than
+    QC-FC: signed mean Fisher-z (red=positive, blue=negative), and no fixed
+    edge_kwargs linewidth -- nilearn's plot_connectome already scales
+    linewidth by |value| internally, which is exactly what we want here."""
+    if not fc_significant_mat.any():
+        print("no FDR-significant FC edges -- skipping FC connectome plot")
+        return
+
+    coords, _ = plotting.find_parcellation_cut_coords(
+        connectome_atlas_path, return_label_names=True
+    )
+    strength = np.where(fc_significant_mat, mean_z_mat, 0)
+    n_significant = int(fc_significant_mat.sum() / 2)
+    vmax = float(np.abs(mean_z_mat[fc_significant_mat]).max())
+    cmap = "RdBu_r"
+
+    fig = plt.figure(figsize=(16, 7.7))
+    x_rect = (0.00, 0.0, 0.30, 1.0)
+    y_rect = (0.30, 0.0, 0.30, 1.0)
+    z_rect = (0.60, 0.0, 0.32, 1.0)
+    common_kwargs = dict(
+        adjacency_matrix=strength,
+        node_coords=coords,
+        node_color="#333333",
+        node_size=14,
+        edge_cmap=cmap,
+        edge_vmin=-vmax,
+        edge_vmax=vmax,
+        edge_kwargs={"alpha": 1.0},
+        annotate=False,
+        colorbar=False,
+        figure=fig,
+    )
+    plotting.plot_connectome(
+        display_mode="x", axes=x_rect,
+        title=f"FC significant edges (n={n_significant:,})", **common_kwargs,
+    )
+    plotting.plot_connectome(display_mode="y", axes=y_rect, **common_kwargs)
+    plotting.plot_connectome(display_mode="z", axes=z_rect, **common_kwargs)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    buf.seek(0)
+    img = plt.imread(buf)
+    img_h, img_w = img.shape[:2]
+    x0_px = int(z_rect[0] * img_w)
+    x1_px = int((z_rect[0] + z_rect[2]) * img_w)
+    nonwhite_rows = np.where(np.any(img[:, x0_px:x1_px, :3] < 0.98, axis=(1, 2)))[0]
+    cbar_y0 = 1 - nonwhite_rows.max() / img_h
+    cbar_y1 = 1 - nonwhite_rows.min() / img_h
+
+    cbar_x0 = z_rect[0] + z_rect[2] + 0.015
+    cbar_ax = fig.add_axes([cbar_x0, cbar_y0, 0.02, cbar_y1 - cbar_y0])
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=Normalize(vmin=-vmax, vmax=vmax))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, cax=cbar_ax)
+    cbar.set_label("Mean Fisher-z FC", fontsize=12)
+
+    fig.savefig(os.path.join(fig_dir, "fc_connectome.png"), dpi=150)
+    plt.close(fig)
+
+
+def make_fc_significance_plots(
+    output_dir, connectome_atlas_path=DEFAULT_CONNECTOME_ATLAS_PATH,
+    network_labels_csv=DEFAULT_NETWORK_LABELS_CSV,
+) -> None:
+    """Plots for run_fc_significance_analysis()'s output (fc_mean_z.npy,
+    fc_significant.npy) -- a lighter-weight companion to make_plots(), since
+    that analysis doesn't produce the full manifest/QC-FC/modularity set."""
+    mean_z_mat = np.load(os.path.join(output_dir, "fc_mean_z.npy"))
+    fc_significant_mat = np.load(os.path.join(output_dir, "fc_significant.npy"))
+
+    fig_dir = os.path.join(output_dir, "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+
+    plot_mean_fc_matrix(fig_dir, mean_z_mat, network_labels_csv)
+    plot_fc_connectome_figure(fig_dir, mean_z_mat, fc_significant_mat, connectome_atlas_path)
+    print(f"saved plots -> {fig_dir}")
+
+
 def make_plots(
     output_dir, method_name, connectome_atlas_path,
     r_mat, fdr_mat, dist_mat, qcfc_r, q_values, fd, dvars_values, tsnr_values, gs_std_values,
@@ -1035,8 +1283,32 @@ def make_plots(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate denoising-evaluation figures from saved results")
     parser.add_argument(
-        "--result_dir", required=True,
+        "--result_dir", default=None,
         help="Pipeline output_dir written by denoising_evaluation.py (contains manifest.csv, qc_fc_*.npy, ...)",
+    )
+    parser.add_argument(
+        "--fc_significance_dir", default=None,
+        help="Output_dir written by --fc_significance_only (contains fc_mean_z.npy, fc_significant.npy) "
+             "-- plots just the mean-FC matrix + FC connectome, instead of the standard full plot set",
+    )
+    parser.add_argument(
+        "--compare_fc_raw_dir", default=None,
+        help="Raw --fc_significance_only output_dir -- set together with --compare_fc_denoised_dir to "
+             "put both mean-FC matrices on a shared color scale and plot their delta, instead of any "
+             "other mode",
+    )
+    parser.add_argument(
+        "--compare_fc_denoised_dir", default=None,
+        help="Denoised --fc_significance_only output_dir, paired with --compare_fc_raw_dir",
+    )
+    parser.add_argument(
+        "--compare_fc_reference_dir", default=None,
+        help="Optional low-motion-reference output_dir, folded into the same shared p99 color "
+             "scale as --compare_fc_raw_dir/--compare_fc_denoised_dir for a fair three-way comparison",
+    )
+    parser.add_argument(
+        "--comparison_output_dir", default=None,
+        help="Where to save delta_fc_matrix.png (default: <PIPELINE_EVAL_ROOT>/fc_matrix_comparison)",
     )
     parser.add_argument(
         "--method_name", default="Raw",
@@ -1044,13 +1316,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--connectome_atlas_path", default=DEFAULT_CONNECTOME_ATLAS_PATH)
     parser.add_argument("--network_labels_csv", default=DEFAULT_NETWORK_LABELS_CSV)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if bool(args.compare_fc_raw_dir) != bool(args.compare_fc_denoised_dir):
+        parser.error("--compare_fc_raw_dir and --compare_fc_denoised_dir must be given together")
+    if not args.result_dir and not args.fc_significance_dir and not args.compare_fc_raw_dir:
+        parser.error("one of --result_dir, --fc_significance_dir, or the --compare_fc_*_dir pair is required")
+    return args
 
 
 if __name__ == "__main__":
     args = parse_args()
-    data = load_results(args.result_dir)
-    make_plots(
-        args.result_dir, args.method_name, args.connectome_atlas_path,
-        network_labels_csv=args.network_labels_csv, **data,
-    )
+    if args.compare_fc_raw_dir:
+        comparison_output_dir = args.comparison_output_dir or os.path.join(PIPELINE_EVAL_ROOT, "fc_matrix_comparison")
+        plot_fc_matrix_comparison(
+            args.compare_fc_raw_dir, args.compare_fc_denoised_dir, comparison_output_dir, args.network_labels_csv,
+            reference_dir=args.compare_fc_reference_dir,
+        )
+    elif args.fc_significance_dir:
+        make_fc_significance_plots(args.fc_significance_dir, args.connectome_atlas_path, args.network_labels_csv)
+    else:
+        data = load_results(args.result_dir)
+        make_plots(
+            args.result_dir, args.method_name, args.connectome_atlas_path,
+            network_labels_csv=args.network_labels_csv, **data,
+        )

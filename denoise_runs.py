@@ -27,6 +27,9 @@ class DenoiseConfig:
     output_root: str
     log_path: str
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    # Set to denoise every video run (both age groups, every session/run)
+    # instead of select_runs()'s first-run-per-subject 2mo-only population.
+    all_runs: bool = False
 
 
 def get_git_commit() -> str:
@@ -61,6 +64,15 @@ def select_runs(config: DenoiseConfig) -> pd.DataFrame:
     cols = ["subject_id", "session_id", "run_id", "source_volume_path"]
     runs = v[cols].drop_duplicates().sort_values(["subject_id", "session_id", "run_id"])
     return runs.groupby("subject_id", as_index=False).first()
+
+
+def select_all_video_runs(config: DenoiseConfig) -> pd.DataFrame:
+    """Every video-task run, both age groups (2mo + 9mo) and every session/run
+    -- not just select_runs()'s first-run-per-subject 2mo-only population."""
+    meta = pd.read_csv(config.chunk_metadata_csv, dtype={"session_id": str, "run_id": str})
+    v = meta[meta["task"] == "videos"]
+    cols = ["subject_id", "session_id", "run_id", "source_volume_path"]
+    return v[cols].drop_duplicates().sort_values(["subject_id", "session_id", "run_id"])
 
 
 def pad_spatial(chunk: torch.Tensor) -> torch.Tensor:
@@ -117,8 +129,8 @@ def run_denoise(config: DenoiseConfig) -> None:
         run_stats_csv=config.run_stats_csv, output_dir=config.output_root, device=config.device,
     ))
     run_stats = _load_run_stats(config.run_stats_csv)
-    runs = select_runs(config)
-    print(f"{len(runs)} subjects")
+    runs = select_all_video_runs(config) if config.all_runs else select_runs(config)
+    print(f"{len(runs)} runs" if config.all_runs else f"{len(runs)} subjects")
 
     for i, row in enumerate(runs.itertuples(index=False), 1):
         key = (row.subject_id, str(row.session_id), str(row.run_id), "videos")
@@ -165,7 +177,7 @@ def parse_args() -> DenoiseConfig:
     parser.add_argument(
         "--run_stats_csv", default=(
             "/lustre/disk/home/users/mfaizan/motion_correction/prototyping/"
-            "motion-artefacts-correction/run_normalization_stats_hfiltered.csv"
+            "motion-artefacts-correction/all_dataset/run_normalization_stats_hfiltered.csv"
         ),
     )
     parser.add_argument(
@@ -185,6 +197,11 @@ def parse_args() -> DenoiseConfig:
             "/lustre/disk/home/users/mfaizan/motion_correction/prototyping/"
             "motion-artefacts-correction/runs/st_v4_ddp_disc_temporal_roi/denoise_runs_log.csv"
         ),
+    )
+    parser.add_argument(
+        "--all_runs", action="store_true",
+        help="Denoise every video run (2mo + 9mo, every session/run) instead of just "
+             "the first-run-per-subject 2mo population",
     )
     args = parser.parse_args()
     return DenoiseConfig(**vars(args))

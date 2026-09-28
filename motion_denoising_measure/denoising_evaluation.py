@@ -22,6 +22,8 @@ from statsmodels.stats.multitest import multipletests
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from losses import _pearson_corr_matrix
+from atlas_fc import load_age_atlases_cropped
+from connectivity.create_roi_timeseries import ROITimeseriesConfig, extract_and_filter
 
 PIPELINE_EVAL_ROOT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "motion_denoising_pipeline_level_evaluation"
@@ -52,6 +54,17 @@ class EvalConfig:
     # instead of the standard single-pipeline evaluation -- see
     # run_modularity_comparison().
     corrected_roi_timeseries_root: Optional[str] = None
+    # Set to run only the lightweight per-edge FC-significance analysis (see
+    # run_fc_significance_analysis()) instead of the full evaluation --
+    # skips the expensive modularity step entirely. roi_timeseries_root
+    # selects raw vs. denoised, same convention as everywhere else.
+    fc_significance_only: bool = False
+    # Set to run the low-motion resting-state reference analysis instead
+    # (see run_low_motion_reference_analysis()) -- an independent "gold
+    # standard" FC estimate, unrelated to the correction model.
+    low_motion_reference: bool = False
+    max_mean_fd: float = 0.2
+    max_peak_fd: float = 0.3
 
 def get_git_commit() -> str:
     try:
@@ -628,6 +641,198 @@ def run_evaluation(config: EvalConfig) -> dict:
     }
 
 
+def select_low_motion_rest_runs(
+    config: EvalConfig, max_mean_fd: float = 0.2, max_peak_fd: float = 0.3,
+) -> pd.DataFrame:
+    """Resting-state (rest10) runs with mean FD <= max_mean_fd and peak FD <
+    max_peak_fd -- a low-motion reference population, independent of the
+    video-task subjects used everywhere else in this file. Same 2mo/non-A
+    scope as select_first_runs, first qualifying run per subject."""
+    meta = pd.read_csv(config.chunk_metadata_csv)
+    v = meta[(meta["task"] == "rest10") & (meta["age_group"] == "2mo")]
+    v = v[~v["subject_id"].str.endswith("A")]
+    cols = ["subject_id", "session_id", "run_id", "age_group", "tr_seconds", "source_volume_path", "fd_path"]
+    runs = v[cols].drop_duplicates().sort_values(["subject_id", "session_id", "run_id"])
+
+    mean_fds, max_fds = [], []
+    for row in runs.itertuples(index=False):
+        fd = pd.read_csv(row.fd_path)["FramewiseDisplacement"]
+        mean_fds.append(fd.mean())
+        max_fds.append(fd.max())
+    runs = runs.assign(mean_fd=mean_fds, max_fd=max_fds)
+
+    qualifying = runs[(runs["mean_fd"] <= max_mean_fd) & (runs["max_fd"] < max_peak_fd)]
+    return qualifying.groupby("subject_id", as_index=False).first()
+
+
+def run_low_motion_reference_analysis(config: EvalConfig) -> None:
+    """
+    Low-motion resting-state reference: across-subject mean Fisher-z FC (+
+    per-edge one-sample FDR test, same statistics as
+    run_fc_significance_analysis) from the cleanest available runs -- a
+    "gold standard" to compare the denoised video-task FC against,
+    independent of the correction model itself.
+
+    ROI timeseries aren't precomputed for rest10 (create_roi_timeseries.py
+    only ever covered the "videos" task), so they're extracted fresh here,
+    reusing its exact atlas-extraction/cosine-filter code. Saves the same
+    fc_mean_z.npy/fc_significant.npy schema as run_fc_significance_analysis,
+    so the existing plotting functions (make_fc_significance_plots,
+    plot_fc_matrix_comparison) work on this output unchanged.
+    """
+    runs = select_low_motion_rest_runs(config, config.max_mean_fd, config.max_peak_fd)
+    if config.max_subjects is not None:
+        runs = runs.head(config.max_subjects)
+    n = len(runs)
+    print(f"{n} low-motion resting-state subjects "
+          f"(mean FD <= {config.max_mean_fd}, peak FD < {config.max_peak_fd})")
+
+    atlases = load_age_atlases_cropped()
+    roi_config = ROITimeseriesConfig(chunk_metadata_csv="", source_root="", output_root="")
+
+    edge_rows = []
+    n_rois, iu = None, None
+    for i, row in enumerate(runs.itertuples(index=False), 1):
+        roi_ts = extract_and_filter(row, atlases, roi_config)  # (T, n_rois)
+        fc = _pearson_corr_matrix(torch.from_numpy(roi_ts).float()).numpy()
+        if iu is None:
+            n_rois = fc.shape[0]
+            iu = np.triu_indices(n_rois, k=1)
+        edge_rows.append(fisher_z(fc[iu]))
+        print(f"  [{i}/{n}] {row.subject_id}: mean_fd={row.mean_fd:.4f}, max_fd={row.max_fd:.4f}")
+
+    edges = np.stack(edge_rows)
+    _, p = stats.ttest_1samp(edges, popmean=0.0, axis=0)
+    mean_z = edges.mean(axis=0)
+
+    significant = np.zeros_like(p, dtype=bool)
+    q = np.full_like(p, np.nan)
+    valid = np.isfinite(p)
+    significant[valid], q[valid], _, _ = multipletests(p[valid], alpha=config.edge_alpha, method="fdr_bh")
+
+    n_sig = int(significant.sum())
+    n_edges = len(p)
+    median_abs_fc_r = float(np.median(np.abs(np.tanh(mean_z))))
+    print(f"FC one-sample test: {n_sig:,}/{n_edges:,} FDR-significant ({100 * n_sig / n_edges:.2f}%), "
+          f"median |r| = {median_abs_fc_r:.4f}")
+
+    mean_z_mat = np.full((n_rois, n_rois), np.nan)
+    p_mat = np.full((n_rois, n_rois), np.nan)
+    q_mat = np.full((n_rois, n_rois), np.nan)
+    sig_mat = np.zeros((n_rois, n_rois), dtype=bool)
+    for mat, vec in ((mean_z_mat, mean_z), (p_mat, p), (q_mat, q)):
+        mat[iu] = vec
+        mat.T[iu] = vec
+    sig_mat[iu] = significant
+    sig_mat.T[iu] = significant
+
+    os.makedirs(config.output_dir, exist_ok=True)
+    np.save(os.path.join(config.output_dir, "fc_mean_z.npy"), mean_z_mat)
+    np.save(os.path.join(config.output_dir, "fc_p.npy"), p_mat)
+    np.save(os.path.join(config.output_dir, "fc_q.npy"), q_mat)
+    np.save(os.path.join(config.output_dir, "fc_significant.npy"), sig_mat)
+    runs[["subject_id", "session_id", "run_id", "mean_fd", "max_fd"]].to_csv(
+        os.path.join(config.output_dir, "low_motion_runs.csv"), index=False
+    )
+
+    with open(os.path.join(config.output_dir, "fc_significance_summary.txt"), "w") as f:
+        f.write(f"n_subjects: {n}\n")
+        f.write(f"max_mean_fd: {config.max_mean_fd}\n")
+        f.write(f"max_peak_fd: {config.max_peak_fd}\n")
+        f.write(f"n_edges: {n_edges}\n")
+        f.write(f"n_fc_significant: {n_sig}\n")
+        f.write(f"pct_fc_significant: {100 * n_sig / n_edges:.4f}\n")
+        f.write(f"mean_z_min: {np.nanmin(mean_z):.4f}\n")
+        f.write(f"mean_z_max: {np.nanmax(mean_z):.4f}\n")
+        f.write(f"median_abs_fc_r: {median_abs_fc_r:.4f}\n")
+    print(f"saved results -> {config.output_dir}")
+
+    append_run_log(config, n, {
+        "low_motion_reference_max_mean_fd": config.max_mean_fd,
+        "low_motion_reference_max_peak_fd": config.max_peak_fd,
+        "low_motion_reference_median_abs_fc_r": median_abs_fc_r,
+        "fc_significance_n_edges": n_edges,
+        "fc_significance_n_significant": n_sig,
+        "fc_significance_pct_significant": 100 * n_sig / n_edges,
+    })
+
+
+def run_fc_significance_analysis(config: EvalConfig) -> None:
+    """
+    Per-edge test of whether FC is consistently different from zero across
+    subjects: one-sample two-sided t-test on each edge's Fisher-z FC values
+    (t_e = mean_z / (sd_z / sqrt(N)), df = N-1), BH-FDR corrected across all
+    edges. Also yields the across-subject mean Fisher-z FC matrix. Lightweight
+    (no modularity) -- roi_timeseries_root selects raw vs. denoised, same as
+    everywhere else in this file.
+    """
+    runs = select_first_runs(config)
+    if config.max_subjects is not None:
+        runs = runs.head(config.max_subjects)
+    n = len(runs)
+    print(f"{n} subjects")
+
+    edge_rows = []
+    n_rois, iu = None, None
+    for i, row in enumerate(runs.itertuples(index=False), 1):
+        roi_ts = np.load(roi_ts_path(row.source_volume_path, config))
+        fc = _pearson_corr_matrix(torch.from_numpy(roi_ts).float()).numpy()
+        if iu is None:
+            n_rois = fc.shape[0]
+            iu = np.triu_indices(n_rois, k=1)
+        edge_rows.append(fisher_z(fc[iu]))
+        if i % 32 == 0 or i == n:
+            print(f"  {i}/{n}")
+
+    edges = np.stack(edge_rows)  # (n_subjects, n_edges)
+    _, p = stats.ttest_1samp(edges, popmean=0.0, axis=0)
+    mean_z = edges.mean(axis=0)
+
+    significant = np.zeros_like(p, dtype=bool)
+    q = np.full_like(p, np.nan)
+    valid = np.isfinite(p)
+    significant[valid], q[valid], _, _ = multipletests(p[valid], alpha=config.edge_alpha, method="fdr_bh")
+
+    n_sig = int(significant.sum())
+    n_edges = len(p)
+    median_abs_fc_r = float(np.median(np.abs(np.tanh(mean_z))))
+    print(f"FC one-sample test: {n_sig:,}/{n_edges:,} FDR-significant ({100 * n_sig / n_edges:.2f}%), "
+          f"median |r| = {median_abs_fc_r:.4f}")
+
+    mean_z_mat = np.full((n_rois, n_rois), np.nan)
+    p_mat = np.full((n_rois, n_rois), np.nan)
+    q_mat = np.full((n_rois, n_rois), np.nan)
+    sig_mat = np.zeros((n_rois, n_rois), dtype=bool)
+    for mat, vec in ((mean_z_mat, mean_z), (p_mat, p), (q_mat, q)):
+        mat[iu] = vec
+        mat.T[iu] = vec
+    sig_mat[iu] = significant
+    sig_mat.T[iu] = significant
+
+    os.makedirs(config.output_dir, exist_ok=True)
+    np.save(os.path.join(config.output_dir, "fc_mean_z.npy"), mean_z_mat)
+    np.save(os.path.join(config.output_dir, "fc_p.npy"), p_mat)
+    np.save(os.path.join(config.output_dir, "fc_q.npy"), q_mat)
+    np.save(os.path.join(config.output_dir, "fc_significant.npy"), sig_mat)
+
+    with open(os.path.join(config.output_dir, "fc_significance_summary.txt"), "w") as f:
+        f.write(f"n_subjects: {n}\n")
+        f.write(f"n_edges: {n_edges}\n")
+        f.write(f"n_fc_significant: {n_sig}\n")
+        f.write(f"pct_fc_significant: {100 * n_sig / n_edges:.4f}\n")
+        f.write(f"mean_z_min: {np.nanmin(mean_z):.4f}\n")
+        f.write(f"mean_z_max: {np.nanmax(mean_z):.4f}\n")
+        f.write(f"median_abs_fc_r: {median_abs_fc_r:.4f}\n")
+    print(f"saved results -> {config.output_dir}")
+
+    append_run_log(config, n, {
+        "fc_significance_n_edges": n_edges,
+        "fc_significance_n_significant": n_sig,
+        "fc_significance_pct_significant": 100 * n_sig / n_edges,
+        "fc_significance_median_abs_fc_r": median_abs_fc_r,
+    })
+
+
 def run_modularity_comparison(config: EvalConfig) -> None:
     """
     Per-subject raw-vs-corrected community/modularity comparison: shows
@@ -742,6 +947,18 @@ def parse_args() -> EvalConfig:
         help="Set to run the raw-vs-corrected modularity/community comparison instead of standard evaluation",
     )
     parser.add_argument(
+        "--fc_significance_only", action="store_true",
+        help="Run only the lightweight per-edge FC-significance analysis (no modularity)",
+    )
+    parser.add_argument(
+        "--low_motion_reference", action="store_true",
+        help="Run the low-motion resting-state reference analysis (rest10, mean/peak FD thresholded)",
+    )
+    parser.add_argument("--max_mean_fd", type=float, default=0.2,
+                         help="Low-motion reference: max allowed mean FD per run (mm)")
+    parser.add_argument("--max_peak_fd", type=float, default=0.3,
+                         help="Low-motion reference: max allowed peak FD per run (mm)")
+    parser.add_argument(
         "--atlas_path", default=(
             "/lustre/disk/home/shared/cusacklab/foundcog/bids/derivatives/"
             "templates/rois/Schaefer2018_400Parcels_7Networks_order_space-nihpd-02-05_2mm.nii.gz"
@@ -780,7 +997,11 @@ def parse_args() -> EvalConfig:
 
 if __name__ == "__main__":
     config = parse_args()
-    if config.corrected_roi_timeseries_root:
+    if config.low_motion_reference:
+        run_low_motion_reference_analysis(config)
+    elif config.fc_significance_only:
+        run_fc_significance_analysis(config)
+    elif config.corrected_roi_timeseries_root:
         run_modularity_comparison(config)
     else:
         run_evaluation(config)
